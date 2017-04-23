@@ -19,6 +19,7 @@
 #include <linux/blockgroup_lock.h>
 #include <linux/percpu_counter.h>
 #include <linux/rbtree.h>
+#include <linux/types.h>
 
 /* XXX Here for now... not interested in restructing headers JUST now */
 
@@ -69,6 +70,9 @@ struct ext2_block_alloc_info {
  * second extended-fs super-block data in memory
  */
 struct ext2_sb_info {
+	unsigned long s_initsize;	/* Size of nvm in bytes, default=0 */
+	phys_addr_t   s_phys_addr;
+	void	      *s_virt_addr;
 	unsigned long s_frag_size;	/* Size of a fragment in bytes */
 	unsigned long s_frags_per_block;/* Number of fragments per block */
 	unsigned long s_inodes_per_block;/* Number of inodes per block */

@@ -16,6 +16,8 @@
  *        David S. Miller (davem@caip.rutgers.edu), 1995
  */
 
+#include <linux/kernel.h>
+#include <linux/ctype.h>
 #include <linux/module.h>
 #include <linux/string.h>
 #include <linux/fs.h>
@@ -32,11 +34,13 @@
 #include <linux/mount.h>
 #include <linux/log2.h>
 #include <linux/quotaops.h>
+#include <linux/io.h>
 #include <asm/uaccess.h>
 #include "ext2.h"
 #include "xattr.h"
 #include "acl.h"
 #include "xip.h"
+#include "ext2_nvm.h"
 
 static void ext2_sync_super(struct super_block *sb,
 			    struct ext2_super_block *es);
@@ -382,7 +386,8 @@ enum {
 	Opt_err_ro, Opt_nouid32, Opt_nocheck, Opt_debug,
 	Opt_oldalloc, Opt_orlov, Opt_nobh, Opt_user_xattr, Opt_nouser_xattr,
 	Opt_acl, Opt_noacl, Opt_xip, Opt_ignore, Opt_err, Opt_quota,
-	Opt_usrquota, Opt_grpquota, Opt_reservation, Opt_noreservation
+	Opt_usrquota, Opt_grpquota, Opt_reservation, Opt_noreservation,
+	Opt_addr, Opt_size
 };
 
 static const match_table_t tokens = {
@@ -416,13 +421,15 @@ static const match_table_t tokens = {
 	{Opt_usrquota, "usrquota"},
 	{Opt_reservation, "reservation"},
 	{Opt_noreservation, "noreservation"},
+	{Opt_addr, "physaddr=%x"},
+	{Opt_size, "init=%s"},
 	{Opt_err, NULL}
 };
 
 static int parse_options (char * options,
 			  struct ext2_sb_info *sbi)
 {
-	char * p;
+	char *p, *rest;
 	substring_t args[MAX_OPT_ARGS];
 	int option;
 
@@ -436,6 +443,17 @@ static int parse_options (char * options,
 
 		token = match_token(p, tokens, args);
 		switch (token) {
+		case Opt_addr:
+			/* physaddr managed in get_phys_addr() */
+			break;
+		case Opt_size:
+			/* memparse() will accept a K/M/G without a digit */
+			if (!isdigit(*args[0].from))
+				goto bad_val;
+			/* llu => ul happens here */
+			sbi->s_initsize = memparse(args[0].from, &rest);
+			set_opt(sbi->s_mount_opt, NVM);
+			break;
 		case Opt_bsd_df:
 			clear_opt (sbi->s_mount_opt, MINIX_DF);
 			break;
@@ -547,7 +565,6 @@ static int parse_options (char * options,
 
 			break;
 #endif
-
 		case Opt_reservation:
 			set_opt(sbi->s_mount_opt, RESERVATION);
 			printk("reservations ON\n");
@@ -563,6 +580,10 @@ static int parse_options (char * options,
 		}
 	}
 	return 1;
+bad_val:
+	printk(KERN_INFO "Bad value '%s' for mount option '%s'\n", args[0].from,
+	       p);
+	return 0;
 }
 
 static int ext2_setup_super (struct super_block * sb,
@@ -714,7 +735,7 @@ static unsigned long descriptor_loc(struct super_block *sb,
 	struct ext2_sb_info *sbi = EXT2_SB(sb);
 	unsigned long bg, first_meta_bg;
 	int has_super = 0;
-	
+
 	first_meta_bg = le32_to_cpu(sbi->s_es->s_first_meta_bg);
 
 	if (!EXT2_HAS_INCOMPAT_FEATURE(sb, EXT2_FEATURE_INCOMPAT_META_BG) ||
@@ -725,6 +746,31 @@ static unsigned long descriptor_loc(struct super_block *sb,
 		has_super = 1;
 
 	return ext2_group_first_block_no(sb, bg) + has_super;
+}
+
+static phys_addr_t get_phys_addr(void **data)
+{
+	phys_addr_t phys_addr;
+	char *options = (char *)*data;
+
+	if (!options || strncmp(options, "physaddr=", 9) != 0)
+		return (phys_addr_t)ULLONG_MAX;
+	options += 9;
+	phys_addr = (phys_addr_t)simple_strtoull(options, &options, 0);
+	if (*options && *options != ',') {
+		printk(KERN_ERR "Invalid phys addr specification: %s\n",
+		       (char *)*data);
+		return (phys_addr_t)ULLONG_MAX;
+	}
+	if (phys_addr & (PAGE_SIZE - 1)) {
+		printk(KERN_ERR "physical address 0x%16llx for pmfs isn't "
+		       "aligned to a page boundary\n", (u64)phys_addr);
+		return (phys_addr_t)ULLONG_MAX;
+	}
+	if (*options == ',')
+		options++;
+	*data = (void *)options;
+	return phys_addr;
 }
 
 static int ext2_fill_super(struct super_block *sb, void *data, int silent)
@@ -758,6 +804,35 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 	sb->s_fs_info = sbi;
 	sbi->s_sb_block = sb_block;
 
+	if (!parse_options ((char *) data, sbi))
+		goto failed_sbi;
+
+	/*
+	 * If there are NVM devices that we should use them as cache for
+	 * the blkdev.
+	 */
+	if (!test_opt(sb, NVM))
+		goto normal_ext2;
+	sbi->s_phys_addr = get_phys_addr(&data);
+	if (sbi->s_phys_addr == (phys_addr_t)ULLONG_MAX) {
+		printk ("EXT2-fs: unable to get nvm physical address\n");
+		clear_opt(sbi->s_mount_opt, NVM);
+		goto normal_ext2;
+	}
+	/* Map NVM to virtual address space with ioremmap */
+	sbi->s_virt_addr = ext2_nvm_ioremap(sb, sbi->s_phys_addr, sbi->s_initsize);
+	if (!sbi->s_virt_addr) {
+		printk("EXT2-fs: ioremap of the nvm failed\n");
+		release_mem_region(sbi->s_phys_addr, sbi->s_initsize);
+		clear_opt(sbi->s_mount_opt, NVM);
+		goto normal_ext2;
+	}
+	/*
+	 * TODO: Load ext2 in-disk metadata into NVM and wrapper metadata
+	 * getting API with NVM.
+	 */
+
+normal_ext2:
 	/*
 	 * See what the current blocksize for the device is, and
 	 * use that as the blocksize.  Otherwise (or if the blocksize
@@ -773,7 +848,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 
 	/*
 	 * If the superblock doesn't start on a hardware sector boundary,
-	 * calculate the offset.  
+	 * calculate the offset.
 	 */
 	if (blocksize != BLOCK_SIZE) {
 		logic_sb_block = (sb_block*BLOCK_SIZE) / blocksize;
@@ -786,6 +861,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 		printk ("EXT2-fs: unable to read superblock\n");
 		goto failed_sbi;
 	}
+
 	/*
 	 * Note: s_es must be initialized as soon as possible because
 	 *       some ext2 macro-instructions depend on its value
@@ -797,7 +873,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 	if (sb->s_magic != EXT2_SUPER_MAGIC)
 		goto cantfind_ext2;
 
-	/* Set defaults before we parse the mount options */
+	/* Set defaults after we parse the mount options */
 	def_mount_opts = le32_to_cpu(es->s_default_mount_opts);
 	if (def_mount_opts & EXT2_DEFM_DEBUG)
 		set_opt(sbi->s_mount_opt, DEBUG);
@@ -813,7 +889,6 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 	if (def_mount_opts & EXT2_DEFM_ACL)
 		set_opt(sbi->s_mount_opt, POSIX_ACL);
 #endif
-	
 	if (le16_to_cpu(sbi->s_es->s_errors) == EXT2_ERRORS_PANIC)
 		set_opt(sbi->s_mount_opt, ERRORS_PANIC);
 	else if (le16_to_cpu(sbi->s_es->s_errors) == EXT2_ERRORS_CONTINUE)
@@ -823,11 +898,8 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 
 	sbi->s_resuid = le16_to_cpu(es->s_def_resuid);
 	sbi->s_resgid = le16_to_cpu(es->s_def_resgid);
-	
-	set_opt(sbi->s_mount_opt, RESERVATION);
 
-	if (!parse_options ((char *) data, sbi))
-		goto failed_mount;
+	set_opt(sbi->s_mount_opt, RESERVATION);
 
 	sb->s_flags = (sb->s_flags & ~MS_POSIXACL) |
 		((EXT2_SB(sb)->s_mount_opt & EXT2_MOUNT_POSIX_ACL) ?
