@@ -1,6 +1,7 @@
 
 #include <linux/fs.h>
 #include <linux/ext2_fs.h>
+#include <linux/ext2_fs_nvm.h>
 
 /*
  * ext2 mount options

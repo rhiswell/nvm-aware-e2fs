@@ -283,6 +283,11 @@ static int ext2_show_options(struct seq_file *seq, struct vfsmount *vfs)
 	if (!test_opt(sb, RESERVATION))
 		seq_puts(seq, ",noreservation");
 
+	if (test_opt(sb, NVM))
+		seq_puts(seq, ",nvm");
+	if (!test_opt(sb, NVM))
+		seq_puts(seq, ",nonvm");
+
 	return 0;
 }
 
@@ -426,10 +431,49 @@ static const match_table_t tokens = {
 	{Opt_err, NULL}
 };
 
+/* Has NVM? */
+static int parse_options_early(char *options, struct ext2_nvm_info *nvmi)
+{
+	char *p, *rest;
+	substring_t args[MAX_OPT_ARGS];
+	int ret = 0;
+
+	if (!options)
+		return 0;
+
+	while ((p = strsep (&options, ",")) != NULL) {
+		int token;
+		if (!*p)
+			continue;
+		token = match_token(p, tokens, args);
+		switch (token) {
+		case Opt_addr:
+			/* physaddr managed in get_phys_addr() */
+			++ret;
+			break;
+		case Opt_size:
+			/* memparse() will accept a K/M/G without a digit */
+			if (!isdigit(*args[0].from))
+				goto bad_val;
+			/* llu => ul happens here */
+			nvmi->initsize = memparse(args[0].from, &rest);
+			++ret;
+			break;
+		default:
+			return 0;
+		}
+	}
+	return ret;
+bad_val:
+	printk(KERN_INFO "Bad value '%s' for mount option '%s'\n", args[0].from,
+	       p);
+	return 0;
+}
+
 static int parse_options (char * options,
 			  struct ext2_sb_info *sbi)
 {
-	char *p, *rest;
+	char *p;
 	substring_t args[MAX_OPT_ARGS];
 	int option;
 
@@ -447,12 +491,9 @@ static int parse_options (char * options,
 			/* physaddr managed in get_phys_addr() */
 			break;
 		case Opt_size:
-			/* memparse() will accept a K/M/G without a digit */
-			if (!isdigit(*args[0].from))
-				goto bad_val;
-			/* llu => ul happens here */
-			sbi->s_initsize = memparse(args[0].from, &rest);
-			set_opt(sbi->s_mount_opt, NVM);
+			/*
+			 * nvm related options have been handled in
+			 * parse_options_early */
 			break;
 		case Opt_bsd_df:
 			clear_opt (sbi->s_mount_opt, MINIX_DF);
@@ -580,10 +621,6 @@ static int parse_options (char * options,
 		}
 	}
 	return 1;
-bad_val:
-	printk(KERN_INFO "Bad value '%s' for mount option '%s'\n", args[0].from,
-	       p);
-	return 0;
 }
 
 static int ext2_setup_super (struct super_block * sb,
@@ -748,35 +785,11 @@ static unsigned long descriptor_loc(struct super_block *sb,
 	return ext2_group_first_block_no(sb, bg) + has_super;
 }
 
-static phys_addr_t get_phys_addr(void **data)
-{
-	phys_addr_t phys_addr;
-	char *options = (char *)*data;
-
-	if (!options || strncmp(options, "physaddr=", 9) != 0)
-		return (phys_addr_t)ULLONG_MAX;
-	options += 9;
-	phys_addr = (phys_addr_t)simple_strtoull(options, &options, 0);
-	if (*options && *options != ',') {
-		printk(KERN_ERR "Invalid phys addr specification: %s\n",
-		       (char *)*data);
-		return (phys_addr_t)ULLONG_MAX;
-	}
-	if (phys_addr & (PAGE_SIZE - 1)) {
-		printk(KERN_ERR "physical address 0x%16llx for pmfs isn't "
-		       "aligned to a page boundary\n", (u64)phys_addr);
-		return (phys_addr_t)ULLONG_MAX;
-	}
-	if (*options == ',')
-		options++;
-	*data = (void *)options;
-	return phys_addr;
-}
-
 static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 {
 	struct buffer_head * bh;
 	struct ext2_sb_info * sbi;
+	struct ext2_nvm_info *nvmi;
 	struct ext2_super_block * es;
 	struct inode *root;
 	unsigned long block;
@@ -791,48 +804,57 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 	__le32 features;
 	int err;
 
+	/* parse_options_early > 0 => hasnvm => alloc sbi on nvm zone */
+	nvmi = kzalloc(sizeof(*nvmi), GFP_KERNEL);
+	if (!nvmi)
+		return -ENOMEM;
+	if (!parse_options_early((char *) data, nvmi))
+		goto no_nvm;
+
+	nvmi->phys_addr = get_phys_addr(&data);
+	if (nvmi->phys_addr == (phys_addr_t) ULLONG_MAX) {
+		printk ("EXT2-fs: unable to get nvm physical address\n");
+		goto no_nvm;
+	}
+	/* TODO: API += ext2_nvm_init: backup nvmi & allocator initialization */
+	err = ext2_nvm_init(nvmi);
+	if (!err) {
+		/* NVM is ready, active it and we we'll use it as cache */
+		nvmi->isalive = 1;
+		/* TODO: API += ext2_nvm_zalloc */
+		sbi = (struct ext2_sb_info *) ext2_nvm_zalloc(sizeof(*sbi));
+		if (!sbi)
+			return -ENOMEM;
+		sbi->s_blockgroup_lock = (struct ext2_sb_info *)
+			ext2_nvm_zalloc(sizeof(struct blockgroup_lock));
+		if (!sbi->s_blockgroup_lock)
+			return -ENOMEM;
+		/* ext2 compatible flag: EXT2_MOUNT_NVM <=> nvmi->isalive */
+		set_opt(sbi->s_mount_opt, NVM);
+		goto has_nvm;
+	}
+	/* err in ext2_nvm_init */
+	if (nvmi->virt_addr) {
+		ext2_nvm_iounmap(nvmi->virt_addr, nvmi->initsize);
+		release_mem_region(nvmi->phys_addr, nvmi->initsize);
+	}
+no_nvm:
+	printk("EXT2-fs: unable to set NVM\n");
+	kfree(nvmi);
+
 	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
 	if (!sbi)
 		return -ENOMEM;
-
 	sbi->s_blockgroup_lock =
 		kzalloc(sizeof(struct blockgroup_lock), GFP_KERNEL);
 	if (!sbi->s_blockgroup_lock) {
 		kfree(sbi);
 		return -ENOMEM;
 	}
+has_nvm:
 	sb->s_fs_info = sbi;
 	sbi->s_sb_block = sb_block;
 
-	if (!parse_options ((char *) data, sbi))
-		goto failed_sbi;
-
-	/*
-	 * If there are NVM devices that we should use them as cache for
-	 * the blkdev.
-	 */
-	if (!test_opt(sb, NVM))
-		goto normal_ext2;
-	sbi->s_phys_addr = get_phys_addr(&data);
-	if (sbi->s_phys_addr == (phys_addr_t)ULLONG_MAX) {
-		printk ("EXT2-fs: unable to get nvm physical address\n");
-		clear_opt(sbi->s_mount_opt, NVM);
-		goto normal_ext2;
-	}
-	/* Map NVM to virtual address space with ioremmap */
-	sbi->s_virt_addr = ext2_nvm_ioremap(sb, sbi->s_phys_addr, sbi->s_initsize);
-	if (!sbi->s_virt_addr) {
-		printk("EXT2-fs: ioremap of the nvm failed\n");
-		release_mem_region(sbi->s_phys_addr, sbi->s_initsize);
-		clear_opt(sbi->s_mount_opt, NVM);
-		goto normal_ext2;
-	}
-	/*
-	 * TODO: Load ext2 in-disk metadata into NVM and wrapper metadata
-	 * getting API with NVM.
-	 */
-
-normal_ext2:
 	/*
 	 * See what the current blocksize for the device is, and
 	 * use that as the blocksize.  Otherwise (or if the blocksize
@@ -900,6 +922,9 @@ normal_ext2:
 	sbi->s_resgid = le16_to_cpu(es->s_def_resgid);
 
 	set_opt(sbi->s_mount_opt, RESERVATION);
+
+	if (!parse_options ((char *) data, sbi))
+		goto failed_mount;
 
 	sb->s_flags = (sb->s_flags & ~MS_POSIXACL) |
 		((EXT2_SB(sb)->s_mount_opt & EXT2_MOUNT_POSIX_ACL) ?
@@ -1150,14 +1175,18 @@ failed_mount2:
 	for (i = 0; i < db_count; i++)
 		brelse(sbi->s_group_desc[i]);
 failed_mount_group_desc:
-	kfree(sbi->s_group_desc);
-	kfree(sbi->s_debts);
+	if (!test_opt(sb, NVM)) {
+		kfree(sbi->s_group_desc);
+		kfree(sbi->s_debts);
+	}
 failed_mount:
 	brelse(bh);
 failed_sbi:
 	sb->s_fs_info = NULL;
-	kfree(sbi->s_blockgroup_lock);
-	kfree(sbi);
+	if (!test_opt(sb, NVM)) {
+		kfree(sbi->s_blockgroup_lock);
+		kfree(sbi);
+	}
 	return ret;
 }
 
