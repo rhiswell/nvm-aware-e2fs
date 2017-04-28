@@ -18,6 +18,7 @@
 
 #include <linux/types.h>
 #include <linux/magic.h>
+#include <linux/string.h>
 
 /*
  * The second extended filesystem constants/structures
@@ -141,6 +142,12 @@ struct ext2_group_desc
 	__le16	bg_pad;
 	__le32	bg_reserved[3];
 };
+
+static inline void
+ext2_group_desc_clone(struct ext2_group_desc *dst, struct ext2_group_desc *src)
+{
+	memcpy(dst, src, sizeof(*src));
+}
 
 /*
  * Macro-instructions used to manage group descriptors
@@ -293,6 +300,12 @@ struct ext2_inode {
 	} osd2;				/* OS dependent 2 */
 };
 
+static inline void
+ext2_inode_clone(struct ext2_inode *dst, struct ext2_inode *src)
+{
+	memcpy(dst, src, sizeof(*src));
+}
+
 #define i_size_high	i_dir_acl
 
 #if defined(__KERNEL__) || defined(__linux__)
@@ -442,6 +455,12 @@ struct ext2_super_block {
  	__le32	s_first_meta_bg; 	/* First metablock block group */
 	__u32	s_reserved[190];	/* Padding to the end of the block */
 };
+
+static inline void
+ext2_super_block_clone(struct ext2_super_block *dst, struct ext2_super_block *src)
+{
+	memcpy(dst, src, sizeof(*src));
+}
 
 /*
  * Codes for operating systems

@@ -6,6 +6,8 @@
 #include <linux/mm.h>
 #include <linux/io.h>
 #include <linux/string.h>
+#include <linux/buffer_head.h>
+#include <linux/smp_lock.h>
 #include "ext2.h"
 #include "ext2_nvm.h"
 
@@ -56,27 +58,26 @@ phys_addr_t get_phys_addr(void **data)
 	return phys_addr;
 }
 
-/* TODO#1 */
-void *ext2_nvm_malloc(size_t nbytes)
+void *ext2_nvm_malloc(size_t size)
 {
-	return NULL;
+	return kmalloc(size, GFP_KERNEL);
 }
 
-void *ext2_nvm_zalloc(size_t nbytes)
+void *ext2_nvm_zalloc(size_t size)
 {
-	void *retp = ext2_nvm_malloc(nbytes);
-	if (!retp)
-		memset(retp, 0, nbytes);
-	return retp;
+	return kzalloc(size, GFP_KERNEL);
 }
 
-/* TODO#2 */
-void ext2_nvm_free()
+void *ext2_nvm_calloc(size_t n, size_t size)
 {
-
+	return kcalloc(n, size, GFP_KERNEL);
 }
 
-/* TODO#3 */
+void ext2_nvm_free(void *p)
+{
+	kfree(p);
+}
+
 header_t *ext2_nvm_init_segement(void *start, unsigned long size)
 {
 	return NULL;
@@ -109,11 +110,99 @@ int ext2_nvm_init(struct ext2_nvm_info *nvmi)
 	*/
 
 	/* Initialize the nvm allocator with first fit strategy */
+	/*
 	nvmi->basep = nvmi->virt_addr + reserved;
 	first_segement =
 		ext2_nvm_init_segement(nvmi->basep, nvmi->initsize - reserved);
 	if (!first_segement)
 		return 1;
+	*/
 
 	return 0;
 }
+
+void ext2_nvm_quit(struct super_block *sb)
+{
+	int i;
+	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
+	struct ext2_sb_info *sbi = EXT2_SB(sb);
+
+	if (nvmi->group_desc) {
+		for (i = 0; i < sbi->s_groups_count; ++i)
+			if (nvmi->group_desc[i])
+				ext2_nvm_free(nvmi->group_desc[i]);
+		ext2_nvm_free(nvmi->group_desc);
+	}
+	if (nvmi->es)
+		ext2_nvm_free(nvmi->es);
+	kfree(nvmi);
+}
+
+void ext2_nvm_sync_sb(struct super_block *sb)
+{
+	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
+	struct ext2_sb_info *sbi = EXT2_SB(sb);
+	unsigned long sb_block = sbi->s_sb_block;
+	unsigned long blocksize = BLOCK_SIZE << le32_to_cpu(sbi->s_es->s_log_block_size);
+	unsigned long offset = (sb_block * BLOCK_SIZE) % blocksize;
+	struct buffer_head *bh = sbi->s_sbh;
+	struct ext2_super_block *es;
+
+	/* Locate raw ext2_super_block from buffer */
+	es = (struct ext2_super_block *) (((char *) bh->b_data) + offset);
+	ext2_super_block_clone(es, nvmi->es);
+	mark_buffer_dirty(bh);
+	sync_dirty_buffer(bh);
+}
+
+void ext2_nvm_sync_gd(struct super_block *sb)
+{
+	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
+	struct ext2_sb_info *sbi = EXT2_SB(sb);
+	struct ext2_group_desc *gdp;
+	struct buffer_head *bh;
+	int i;
+
+	for (i = 0; i < sbi->s_groups_count; ++i) {
+		gdp = __ext2_get_group_desc(sb, i, &bh);
+		if (nvmi->group_desc[i]) {
+			ext2_group_desc_clone(gdp, nvmi->group_desc[i]);
+			mark_buffer_dirty(bh);
+			sync_dirty_buffer(bh);
+		}
+	}
+}
+
+void ext2_nvm_sync_inode_bm(struct super_block *sb)
+{
+
+}
+
+void ext2_nvm_sync_block_bm(struct super_block *sb)
+{
+
+}
+
+void ext2_nvm_sync_inode(struct super_block *sb)
+{
+
+}
+
+void ext2_nvm_write_super(struct super_block *sb)
+{
+	struct ext2_super_block *es = EXT2_SB(sb)->s_es;
+
+	lock_kernel();
+	if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
+		ext2_debug("setting valid to 0\n");
+		es->s_state &= cpu_to_le16(~EXT2_VALID_FS);
+		es->s_free_blocks_count =
+			cpu_to_le32(ext2_count_free_blocks(sb));
+		es->s_free_inodes_count =
+			cpu_to_le32(ext2_count_free_inodes(sb));
+		es->s_mtime = cpu_to_le32(get_seconds());
+	}
+	sb->s_dirt = 0;
+	unlock_kernel();
+}
+

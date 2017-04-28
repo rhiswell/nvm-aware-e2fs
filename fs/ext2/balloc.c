@@ -11,11 +11,12 @@
  *        David S. Miller (davem@caip.rutgers.edu), 1995
  */
 
-#include "ext2.h"
 #include <linux/quotaops.h>
 #include <linux/sched.h>
 #include <linux/buffer_head.h>
 #include <linux/capability.h>
+#include "ext2.h"
+#include "ext2_nvm.h"
 
 /*
  * balloc.c contains the blocks allocation and deallocation routines
@@ -35,7 +36,7 @@
 
 #define in_range(b, first, len)	((b) >= (first) && (b) <= (first) + (len) - 1)
 
-struct ext2_group_desc * ext2_get_group_desc(struct super_block * sb,
+struct ext2_group_desc * __ext2_get_group_desc(struct super_block * sb,
 					     unsigned int block_group,
 					     struct buffer_head ** bh)
 {
@@ -67,6 +68,38 @@ struct ext2_group_desc * ext2_get_group_desc(struct super_block * sb,
 	if (bh)
 		*bh = sbi->s_group_desc[group_desc];
 	return desc + offset;
+}
+
+struct ext2_group_desc *ext2_get_group_desc(struct super_block * sb,
+					     unsigned int block_group,
+					     struct buffer_head ** bh)
+{
+	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
+	struct ext2_group_desc *gdp;
+	struct ext2_sb_info *sbi = EXT2_SB(sb);
+
+	if (block_group >= sbi->s_groups_count) {
+		ext2_error (sb, "ext2_get_group_desc",
+			    "block_group >= groups_count - "
+			    "block_group = %d, groups_count = %lu",
+			    block_group, sbi->s_groups_count);
+
+		return NULL;
+	}
+
+	gdp = __ext2_get_group_desc(sb, block_group, bh);
+
+	if (test_opt(sb, NVM)) {
+		/* Demand-caching group descriptors on NVM */
+		if (nvmi->group_desc[block_group] == NULL) {
+			nvmi->group_desc[block_group] =
+				(struct ext2_group_desc *) ext2_nvm_zalloc(sizeof(*gdp));
+			ext2_group_desc_clone(nvmi->group_desc[block_group], gdp);
+		}
+		gdp = nvmi->group_desc[block_group];
+	}
+
+	return gdp;
 }
 
 static int ext2_valid_block_bitmap(struct super_block *sb,
@@ -168,7 +201,7 @@ static void release_blocks(struct super_block *sb, int count)
 	}
 }
 
-static void group_adjust_blocks(struct super_block *sb, int group_no,
+static void __group_adjust_blocks(struct super_block *sb, int group_no,
 	struct ext2_group_desc *desc, struct buffer_head *bh, int count)
 {
 	if (count) {
@@ -182,6 +215,25 @@ static void group_adjust_blocks(struct super_block *sb, int group_no,
 		sb->s_dirt = 1;
 		mark_buffer_dirty(bh);
 	}
+}
+
+static void group_adjust_blocks(struct super_block *sb, int group_no,
+	struct ext2_group_desc *desc, struct buffer_head *bh, int count)
+{
+	if (test_opt(sb, NVM)) {
+		/* In NVM mode, desc points to NVM that is a copy of that in buffer */
+		if (count) {
+			struct ext2_sb_info *sbi = EXT2_SB(sb);
+			unsigned free_blocks;
+
+			spin_lock(sb_bgl_lock(sbi, group_no));
+			free_blocks = le16_to_cpu(desc->bg_free_blocks_count);
+			desc->bg_free_blocks_count = cpu_to_le16(free_blocks + count);
+			spin_unlock(sb_bgl_lock(sbi, group_no));
+			sb->s_dirt = 1;
+		}
+	} else
+		__group_adjust_blocks(sb, group_no, desc, bh, count);
 }
 
 /*
@@ -614,7 +666,7 @@ find_next_usable_block(int start, struct buffer_head *bh, int maxblocks)
 
 	if (start > 0) {
 		/*
-		 * The goal was occupied; search forward for a free 
+		 * The goal was occupied; search forward for a free
 		 * block within the next XX blocks.
 		 *
 		 * end_goal is more or less random, but it has to be
@@ -1209,7 +1261,7 @@ static int ext2_has_free_blocks(struct ext2_sb_info *sbi)
  *
  * ext2_new_blocks uses a goal block to assist allocation.  If the goal is
  * free, or there is a free block within 32 blocks of the goal, that block
- * is allocated.  Otherwise a forward search is made for a free block; within 
+ * is allocated.  Otherwise a forward search is made for a free block; within
  * each block group the search first looks for an entire free byte in the block
  * bitmap, and then for any free bit if that fails.
  * This function also updates quota and i_blocks field.
@@ -1473,7 +1525,7 @@ unsigned long ext2_count_free_blocks (struct super_block * sb)
 		bitmap_bh = read_block_bitmap(sb, i);
 		if (!bitmap_bh)
 			continue;
-		
+
 		x = ext2_count_free(bitmap_bh, sb->s_blocksize);
 		printk ("group %d: stored = %d, counted = %lu\n",
 			i, le16_to_cpu(desc->bg_free_blocks_count), x);

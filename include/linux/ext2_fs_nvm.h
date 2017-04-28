@@ -30,9 +30,12 @@ struct ext2_nvm_info {
 	phys_addr_t	phys_addr;
 	void		*virt_addr;
 	int		isalive;
-	struct ext2_sb_info *sbi;
+
 	header_t	*basep;		/* Pointer of the allocatable region */
-	header_t	*freep;		/* Pointer of thre free list */
+	header_t	*freep;		/* Pointer of the free list */
+
+	struct ext2_group_desc	**group_desc; /* Array of the group descriptors */
+	struct ext2_super_block *es;
 };
 
 #endif	/* _EXT2_FS_NVM */

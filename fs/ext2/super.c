@@ -113,7 +113,21 @@ void ext2_update_dynamic_rev(struct super_block *sb)
 	 */
 }
 
-static void ext2_put_super (struct super_block * sb)
+/*
+ * Copy data from NVM to corresponding buffer and mark_buffer_dirty(bh). And we
+ * should use mark_nvm_dirty instead of mark_buffer_dirty in normal routine.
+ */
+static void ext2_sync_nvm(struct super_block *sb)
+{
+	ext2_nvm_sync_sb(sb);
+	ext2_nvm_sync_gd(sb);
+	/* TODOs */
+	ext2_nvm_sync_inode_bm(sb);
+	ext2_nvm_sync_block_bm(sb);
+	ext2_nvm_sync_inode(sb);
+}
+
+static void ext2_put_super (struct super_block *sb)
 {
 	int db_count;
 	int i;
@@ -131,16 +145,26 @@ static void ext2_put_super (struct super_block * sb)
 		es->s_state = cpu_to_le16(sbi->s_mount_state);
 		ext2_sync_super(sb, es);
 	}
+
+	if (test_opt(sb, NVM))
+		ext2_sync_nvm(sb);
+
+	/* Release buffer of group descriptions */
 	db_count = sbi->s_gdb_count;
 	for (i = 0; i < db_count; i++)
 		if (sbi->s_group_desc[i])
 			brelse (sbi->s_group_desc[i]);
+
 	kfree(sbi->s_group_desc);
 	kfree(sbi->s_debts);
 	percpu_counter_destroy(&sbi->s_freeblocks_counter);
 	percpu_counter_destroy(&sbi->s_freeinodes_counter);
 	percpu_counter_destroy(&sbi->s_dirs_counter);
 	brelse (sbi->s_sbh);
+
+	if (test_opt(sb, NVM))
+		ext2_nvm_quit(sb);
+
 	sb->s_fs_info = NULL;
 	kfree(sbi->s_blockgroup_lock);
 	kfree(sbi);
@@ -804,44 +828,6 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 	__le32 features;
 	int err;
 
-	/* parse_options_early > 0 => hasnvm => alloc sbi on nvm zone */
-	nvmi = kzalloc(sizeof(*nvmi), GFP_KERNEL);
-	if (!nvmi)
-		return -ENOMEM;
-	if (!parse_options_early((char *) data, nvmi))
-		goto no_nvm;
-
-	nvmi->phys_addr = get_phys_addr(&data);
-	if (nvmi->phys_addr == (phys_addr_t) ULLONG_MAX) {
-		printk ("EXT2-fs: unable to get nvm physical address\n");
-		goto no_nvm;
-	}
-	/* TODO: API += ext2_nvm_init: backup nvmi & allocator initialization */
-	err = ext2_nvm_init(nvmi);
-	if (!err) {
-		/* NVM is ready, active it and we we'll use it as cache */
-		nvmi->isalive = 1;
-		/* TODO: API += ext2_nvm_zalloc */
-		sbi = (struct ext2_sb_info *) ext2_nvm_zalloc(sizeof(*sbi));
-		if (!sbi)
-			return -ENOMEM;
-		sbi->s_blockgroup_lock = (struct ext2_sb_info *)
-			ext2_nvm_zalloc(sizeof(struct blockgroup_lock));
-		if (!sbi->s_blockgroup_lock)
-			return -ENOMEM;
-		/* ext2 compatible flag: EXT2_MOUNT_NVM <=> nvmi->isalive */
-		set_opt(sbi->s_mount_opt, NVM);
-		goto has_nvm;
-	}
-	/* err in ext2_nvm_init */
-	if (nvmi->virt_addr) {
-		ext2_nvm_iounmap(nvmi->virt_addr, nvmi->initsize);
-		release_mem_region(nvmi->phys_addr, nvmi->initsize);
-	}
-no_nvm:
-	printk("EXT2-fs: unable to set NVM\n");
-	kfree(nvmi);
-
 	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
 	if (!sbi)
 		return -ENOMEM;
@@ -851,10 +837,40 @@ no_nvm:
 		kfree(sbi);
 		return -ENOMEM;
 	}
-has_nvm:
+
 	sb->s_fs_info = sbi;
 	sbi->s_sb_block = sb_block;
 
+	/* parse_options_early > 0 => hasnvm => alloc sbi on nvm zone */
+	nvmi = kzalloc(sizeof(*nvmi), GFP_KERNEL);
+	if (!nvmi)
+		return -ENOMEM;
+	if (!parse_options_early((char *) data, nvmi))
+		goto nil_nvm;
+
+	nvmi->phys_addr = get_phys_addr(&data);
+	if (nvmi->phys_addr == (phys_addr_t) ULLONG_MAX) {
+		printk ("EXT2-fs: unable to get nvm physical address\n");
+		goto nil_nvm;
+	}
+	err = ext2_nvm_init(nvmi);
+	if (!err) {
+		/* NVM is ready, active it and we we'll use it as cache */
+		nvmi->isalive = 1;
+		/* ext2 compatible flag: EXT2_MOUNT_NVM <=> nvmi->isalive */
+		set_opt(sbi->s_mount_opt, NVM);
+		sb->s_fs_nvmi = nvmi;
+		goto has_nvm;
+	}
+nil_nvm:
+	/* err in ext2_nvm_init, then we should release the iomem region */
+	if (nvmi->virt_addr) {
+		ext2_nvm_iounmap(nvmi->virt_addr, nvmi->initsize);
+		release_mem_region(nvmi->phys_addr, nvmi->initsize);
+	}
+	printk("EXT2-fs: unable to set NVM\n");
+	kfree(nvmi);
+has_nvm:
 	/*
 	 * See what the current blocksize for the device is, and
 	 * use that as the blocksize.  Otherwise (or if the blocksize
@@ -889,7 +905,13 @@ has_nvm:
 	 *       some ext2 macro-instructions depend on its value
 	 */
 	es = (struct ext2_super_block *) (((char *)bh->b_data) + offset);
-	sbi->s_es = es;
+
+	if (test_opt(sb, NVM)) {
+		nvmi->es = ext2_nvm_zalloc(sizeof(*es));
+		ext2_super_block_clone(nvmi->es, es);
+		sbi->s_es = nvmi->es;
+	} else
+		sbi->s_es = es;
 	sb->s_magic = le16_to_cpu(es->s_magic);
 
 	if (sb->s_magic != EXT2_SUPER_MAGIC)
@@ -979,13 +1001,19 @@ has_nvm:
 		logic_sb_block = (sb_block*BLOCK_SIZE) / blocksize;
 		offset = (sb_block*BLOCK_SIZE) % blocksize;
 		bh = sb_bread(sb, logic_sb_block);
-		if(!bh) {
+		if (!bh) {
 			printk("EXT2-fs: Couldn't read superblock on "
 			       "2nd try.\n");
 			goto failed_sbi;
 		}
 		es = (struct ext2_super_block *) (((char *)bh->b_data) + offset);
-		sbi->s_es = es;
+		if (test_opt(sb, NVM)) {
+			if (!nvmi->es)
+				es = ext2_nvm_zalloc(sizeof(*es));
+			ext2_super_block_clone(nvmi->es, es);
+			sbi->s_es = nvmi->es;
+		} else
+			sbi->s_es = es;
 		if (es->s_magic != cpu_to_le16(EXT2_SUPER_MAGIC)) {
 			printk ("EXT2-fs: Magic mismatch, very weird !\n");
 			goto failed_mount;
@@ -1069,22 +1097,35 @@ has_nvm:
 
 	if (EXT2_BLOCKS_PER_GROUP(sb) == 0)
 		goto cantfind_ext2;
- 	sbi->s_groups_count = ((le32_to_cpu(es->s_blocks_count) -
- 				le32_to_cpu(es->s_first_data_block) - 1)
- 					/ EXT2_BLOCKS_PER_GROUP(sb)) + 1;
+	sbi->s_groups_count = ((le32_to_cpu(es->s_blocks_count) -
+				le32_to_cpu(es->s_first_data_block) - 1)
+					/ EXT2_BLOCKS_PER_GROUP(sb)) + 1;
 	db_count = (sbi->s_groups_count + EXT2_DESC_PER_BLOCK(sb) - 1) /
 		   EXT2_DESC_PER_BLOCK(sb);
-	sbi->s_group_desc = kmalloc (db_count * sizeof (struct buffer_head *), GFP_KERNEL);
+	sbi->s_group_desc =
+		kmalloc(db_count * sizeof(struct buffer_head *), GFP_KERNEL);
 	if (sbi->s_group_desc == NULL) {
 		printk ("EXT2-fs: not enough memory\n");
 		goto failed_mount;
 	}
+	if (test_opt(sb, NVM)) {
+		/* Alloc slots of group descriptors in ext2_nvm_info */
+		nvmi->group_desc =
+			ext2_nvm_zalloc(sbi->s_groups_count * sizeof(struct ext2_group_desc *));
+		if (nvmi->group_desc == NULL) {
+			printk ("EXT2-fs: not enough memory\n");
+			goto failed_mount;
+		}
+	}
+
 	bgl_lock_init(sbi->s_blockgroup_lock);
-	sbi->s_debts = kcalloc(sbi->s_groups_count, sizeof(*sbi->s_debts), GFP_KERNEL);
+	sbi->s_debts =
+		kcalloc(sbi->s_groups_count, sizeof(*sbi->s_debts), GFP_KERNEL);
 	if (!sbi->s_debts) {
 		printk ("EXT2-fs: not enough memory\n");
 		goto failed_mount_group_desc;
 	}
+	/* Load group descs' blocks into buffer */
 	for (i = 0; i < db_count; i++) {
 		block = descriptor_loc(sb, logic_sb_block, i);
 		sbi->s_group_desc[i] = sb_bread(sb, block);
@@ -1175,18 +1216,16 @@ failed_mount2:
 	for (i = 0; i < db_count; i++)
 		brelse(sbi->s_group_desc[i]);
 failed_mount_group_desc:
-	if (!test_opt(sb, NVM)) {
-		kfree(sbi->s_group_desc);
-		kfree(sbi->s_debts);
-	}
+	kfree(sbi->s_group_desc);
+	kfree(sbi->s_debts);
 failed_mount:
 	brelse(bh);
 failed_sbi:
+	if (test_opt(sb, NVM))
+		ext2_nvm_quit(sb);
 	sb->s_fs_info = NULL;
-	if (!test_opt(sb, NVM)) {
-		kfree(sbi->s_blockgroup_lock);
-		kfree(sbi);
-	}
+	kfree(sbi->s_blockgroup_lock);
+	kfree(sbi);
 	return ret;
 }
 
@@ -1200,11 +1239,16 @@ static void ext2_commit_super (struct super_block * sb,
 
 static void ext2_sync_super(struct super_block *sb, struct ext2_super_block *es)
 {
-	es->s_free_blocks_count = cpu_to_le32(ext2_count_free_blocks(sb));
-	es->s_free_inodes_count = cpu_to_le32(ext2_count_free_inodes(sb));
-	es->s_wtime = cpu_to_le32(get_seconds());
-	mark_buffer_dirty(EXT2_SB(sb)->s_sbh);
-	sync_dirty_buffer(EXT2_SB(sb)->s_sbh);
+	if (test_opt(sb, NVM)) {
+		ext2_nvm_write_super(sb);
+	} else {
+		/* Old fashion */
+		es->s_free_blocks_count = cpu_to_le32(ext2_count_free_blocks(sb));
+		es->s_free_inodes_count = cpu_to_le32(ext2_count_free_inodes(sb));
+		es->s_wtime = cpu_to_le32(get_seconds());
+		mark_buffer_dirty(EXT2_SB(sb)->s_sbh);
+		sync_dirty_buffer(EXT2_SB(sb)->s_sbh);
+	}
 	sb->s_dirt = 0;
 }
 
@@ -1224,17 +1268,22 @@ static int ext2_sync_fs(struct super_block *sb, int wait)
 	struct ext2_super_block *es = EXT2_SB(sb)->s_es;
 
 	lock_kernel();
-	if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
-		ext2_debug("setting valid to 0\n");
-		es->s_state &= cpu_to_le16(~EXT2_VALID_FS);
-		es->s_free_blocks_count =
-			cpu_to_le32(ext2_count_free_blocks(sb));
-		es->s_free_inodes_count =
-			cpu_to_le32(ext2_count_free_inodes(sb));
-		es->s_mtime = cpu_to_le32(get_seconds());
-		ext2_sync_super(sb, es);
+	if (test_opt(sb, NVM)) {
+		ext2_nvm_write_super(sb);
 	} else {
-		ext2_commit_super(sb, es);
+		/* Old fashion */
+		if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
+			ext2_debug("setting valid to 0\n");
+			es->s_state &= cpu_to_le16(~EXT2_VALID_FS);
+			es->s_free_blocks_count =
+				cpu_to_le32(ext2_count_free_blocks(sb));
+			es->s_free_inodes_count =
+				cpu_to_le32(ext2_count_free_inodes(sb));
+			es->s_mtime = cpu_to_le32(get_seconds());
+			ext2_sync_super(sb, es);
+		} else {
+			ext2_commit_super(sb, es);
+		}
 	}
 	sb->s_dirt = 0;
 	unlock_kernel();
@@ -1242,13 +1291,20 @@ static int ext2_sync_fs(struct super_block *sb, int wait)
 	return 0;
 }
 
-
 void ext2_write_super(struct super_block *sb)
 {
-	if (!(sb->s_flags & MS_RDONLY))
-		ext2_sync_fs(sb, 1);
-	else
-		sb->s_dirt = 0;
+	if (test_opt(sb, NVM)) {
+		/* Just write into nvm */
+		if (!(sb->s_flags & MS_RDONLY))
+			ext2_nvm_write_super(sb);
+		else
+			sb->s_dirt = 0;
+	} else {
+		if (!(sb->s_flags & MS_RDONLY))
+			ext2_sync_fs(sb, 1);
+		else
+			sb->s_dirt = 0;
+	}
 }
 
 static int ext2_remount (struct super_block * sb, int * flags, char * data)
