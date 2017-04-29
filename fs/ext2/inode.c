@@ -36,6 +36,7 @@
 #include "ext2.h"
 #include "acl.h"
 #include "xip.h"
+#include "ext2_nvm.h"
 
 MODULE_AUTHOR("Remy Card and others");
 MODULE_DESCRIPTION("Second Extended Filesystem");
@@ -1003,7 +1004,7 @@ static void ext2_free_branches(struct inode *inode, __le32 *p, __le32 *q, int de
 			/*
 			 * A read failure? Report error and clear slot
 			 * (should be rare).
-			 */ 
+			 */
 			if (!bh) {
 				ext2_error(inode->i_sb, "ext2_free_branches",
 					"Read failure, inode=%ld, block=%ld",
@@ -1131,7 +1132,7 @@ do_indirects:
 	}
 }
 
-static struct ext2_inode *ext2_get_inode(struct super_block *sb, ino_t ino,
+struct ext2_inode *__ext2_get_inode(struct super_block *sb, ino_t ino,
 					struct buffer_head **p)
 {
 	struct buffer_head * bh;
@@ -1172,6 +1173,15 @@ Eio:
 		   (unsigned long) ino, block);
 Egdp:
 	return ERR_PTR(-EIO);
+}
+
+static struct ext2_inode *ext2_get_inode(struct super_block *sb, ino_t ino,
+					struct buffer_head **p)
+{
+	if (test_opt(sb, NVM))
+		return ext2_nvm_get_inode(sb, ino, p);
+	else
+		return __ext2_get_inode(sb, ino, p);
 }
 
 void ext2_set_inode_flags(struct inode *inode)
@@ -1319,7 +1329,7 @@ struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
 		if (raw_inode->i_block[0])
 			init_special_inode(inode, inode->i_mode,
 			   old_decode_dev(le32_to_cpu(raw_inode->i_block[0])));
-		else 
+		else
 			init_special_inode(inode, inode->i_mode,
 			   new_decode_dev(le32_to_cpu(raw_inode->i_block[1])));
 	}
@@ -1327,13 +1337,13 @@ struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
 	ext2_set_inode_flags(inode);
 	unlock_new_inode(inode);
 	return inode;
-	
+
 bad_inode:
 	iget_failed(inode);
 	return ERR_PTR(ret);
 }
 
-int ext2_write_inode(struct inode *inode, int do_sync)
+int __ext2_write_inode(struct inode *inode, int do_sync)
 {
 	struct ext2_inode_info *ei = EXT2_I(inode);
 	struct super_block *sb = inode->i_sb;
@@ -1409,7 +1419,7 @@ int ext2_write_inode(struct inode *inode, int do_sync)
 			}
 		}
 	}
-	
+
 	raw_inode->i_generation = cpu_to_le32(inode->i_generation);
 	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode)) {
 		if (old_valid_dev(inode->i_rdev)) {
@@ -1436,6 +1446,14 @@ int ext2_write_inode(struct inode *inode, int do_sync)
 	ei->i_state &= ~EXT2_STATE_NEW;
 	brelse (bh);
 	return err;
+}
+
+int ext2_write_inode(struct inode *inode, int do_sync)
+{
+	if (test_opt(inode->i_sb, NVM))
+		return ext2_nvm_write_inode(inode, do_sync);
+	else
+		return __ext2_write_inode(inode, do_sync);
 }
 
 int ext2_sync_inode(struct inode *inode)

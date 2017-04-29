@@ -74,32 +74,10 @@ struct ext2_group_desc *ext2_get_group_desc(struct super_block * sb,
 					     unsigned int block_group,
 					     struct buffer_head ** bh)
 {
-	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
-	struct ext2_group_desc *gdp;
-	struct ext2_sb_info *sbi = EXT2_SB(sb);
-
-	if (block_group >= sbi->s_groups_count) {
-		ext2_error (sb, "ext2_get_group_desc",
-			    "block_group >= groups_count - "
-			    "block_group = %d, groups_count = %lu",
-			    block_group, sbi->s_groups_count);
-
-		return NULL;
-	}
-
-	gdp = __ext2_get_group_desc(sb, block_group, bh);
-
-	if (test_opt(sb, NVM)) {
-		/* Demand-caching group descriptors on NVM */
-		if (nvmi->group_desc[block_group] == NULL) {
-			nvmi->group_desc[block_group] =
-				(struct ext2_group_desc *) ext2_nvm_zalloc(sizeof(*gdp));
-			ext2_group_desc_clone(nvmi->group_desc[block_group], gdp);
-		}
-		gdp = nvmi->group_desc[block_group];
-	}
-
-	return gdp;
+	if (test_opt(sb, NVM))
+		return ext2_nvm_get_group_desc(sb, block_group, bh);
+	else
+		return __ext2_get_group_desc(sb, block_group, bh);
 }
 
 static int ext2_valid_block_bitmap(struct super_block *sb,

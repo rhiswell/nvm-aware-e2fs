@@ -113,20 +113,6 @@ void ext2_update_dynamic_rev(struct super_block *sb)
 	 */
 }
 
-/*
- * Copy data from NVM to corresponding buffer and mark_buffer_dirty(bh). And we
- * should use mark_nvm_dirty instead of mark_buffer_dirty in normal routine.
- */
-static void ext2_sync_nvm(struct super_block *sb)
-{
-	ext2_nvm_sync_sb(sb);
-	ext2_nvm_sync_gd(sb);
-	/* TODOs */
-	ext2_nvm_sync_inode_bm(sb);
-	ext2_nvm_sync_block_bm(sb);
-	ext2_nvm_sync_inode(sb);
-}
-
 static void ext2_put_super (struct super_block *sb)
 {
 	int db_count;
@@ -147,7 +133,7 @@ static void ext2_put_super (struct super_block *sb)
 	}
 
 	if (test_opt(sb, NVM))
-		ext2_sync_nvm(sb);
+		ext2_nvm_sync(sb);
 
 	/* Release buffer of group descriptions */
 	db_count = sbi->s_gdb_count;
@@ -472,7 +458,7 @@ static int parse_options_early(char *options, struct ext2_nvm_info *nvmi)
 		token = match_token(p, tokens, args);
 		switch (token) {
 		case Opt_addr:
-			/* physaddr managed in get_phys_addr() */
+			/* physaddr managed in ext2_nvm_get_phys_addr() */
 			++ret;
 			break;
 		case Opt_size:
@@ -512,7 +498,7 @@ static int parse_options (char * options,
 		token = match_token(p, tokens, args);
 		switch (token) {
 		case Opt_addr:
-			/* physaddr managed in get_phys_addr() */
+			/* physaddr managed in ext2_nvm_get_phys_addr() */
 			break;
 		case Opt_size:
 			/*
@@ -848,7 +834,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 	if (!parse_options_early((char *) data, nvmi))
 		goto nil_nvm;
 
-	nvmi->phys_addr = get_phys_addr(&data);
+	nvmi->phys_addr = ext2_nvm_get_phys_addr(&data);
 	if (nvmi->phys_addr == (phys_addr_t) ULLONG_MAX) {
 		printk ("EXT2-fs: unable to get nvm physical address\n");
 		goto nil_nvm;
@@ -1113,7 +1099,7 @@ has_nvm:
 		nvmi->group_desc =
 			ext2_nvm_zalloc(sbi->s_groups_count * sizeof(struct ext2_group_desc *));
 		if (nvmi->group_desc == NULL) {
-			printk ("EXT2-fs: not enough memory\n");
+			printk ("EXT2-fs: not enough memory on NVM\n");
 			goto failed_mount;
 		}
 	}
@@ -1141,6 +1127,19 @@ has_nvm:
 		goto failed_mount2;
 	}
 	sbi->s_gdb_count = db_count;
+
+	/* Hash table for searching raw inodes in NVM */
+	if (test_opt(sb, NVM)) {
+		nvmi->inode_htab =
+			ext2_nvm_calloc(sbi->s_groups_count, sizeof(struct hlist_head));
+		if (!nvmi->inode_htab) {
+			printk("EXT2-fs: not enough memory in NVM\n");
+			goto failed_mount2;
+		}
+		for (i = 0; i < sbi->s_groups_count; ++i)
+			INIT_HLIST_HEAD(&nvmi->inode_htab[i]);
+	}
+
 	get_random_bytes(&sbi->s_next_generation, sizeof(u32));
 	spin_lock_init(&sbi->s_next_gen_lock);
 
