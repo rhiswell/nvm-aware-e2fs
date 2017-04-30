@@ -308,7 +308,7 @@ ext2_nvm_inode_lookup(struct super_block *sb, ino_t ino)
 }
 
 static void
-ext2_nvm_inode_add(struct super_block *sb, struct ext2_nvm_inode *inodep)
+ext2_nvm_inode_install(struct super_block *sb, struct ext2_nvm_inode *inodep)
 {
 	unsigned long block_group = (inodep->ino-1) / EXT2_INODES_PER_GROUP(sb);
 	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
@@ -345,6 +345,19 @@ static void ext2_nvm_inode_mark_clean(struct ext2_nvm_inode *nvm_inode)
 	spin_unlock(&ext2_nvm_inode_lock);
 }
 
+static void ext2_nvm_inode_insert_clean(struct super_block *sb,
+		struct ext2_nvm_inode *nvm_inode)
+{
+
+
+	spin_lock(&ext2_nvm_inode_lock);
+	list_add(&nvm_inode->lru, &ext2_nvm_inode_lru_clean);
+	spin_unlock(&ext2_nvm_inode_lock);
+
+	/* Insert into the hash table of nvm inodes */
+	ext2_nvm_inode_install(sb, nvm_inode);
+}
+
 /* inode-related APIs */
 struct ext2_inode *ext2_nvm_get_inode(struct super_block *sb, ino_t ino,
 					struct buffer_head **p)
@@ -368,10 +381,7 @@ struct ext2_inode *ext2_nvm_get_inode(struct super_block *sb, ino_t ino,
 		ext2_inode_clone(&nvm_inodep->raw_inode, retp);
 
 		/* Insert into clean lru */
-		ext2_nvm_inode_mark_clean(nvm_inodep);
-		/* Insert into the hash table of nvm inodes */
-		ext2_nvm_inode_add(sb, nvm_inodep);
-
+		ext2_nvm_inode_insert_clean(sb, nvm_inodep);
 	}
 	retp = &nvm_inodep->raw_inode;
 failure:
