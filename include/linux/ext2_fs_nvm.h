@@ -26,7 +26,7 @@ union footer {
 typedef union footer footer_t;
 
 struct ext2_nvm_inode {
-	struct list_head  lru;
+	struct list_head  lru;		/* rw lock */
 	struct hlist_node hash;
 	ino_t  ino;
 	struct ext2_inode raw_inode;

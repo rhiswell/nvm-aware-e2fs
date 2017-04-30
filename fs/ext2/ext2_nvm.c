@@ -12,10 +12,12 @@
 #include "ext2.h"
 #include "ext2_nvm.h"
 
-LIST_HEAD(ext2_nvm_inode_lru_dirty);
+LIST_HEAD(ext2_nvm_inode_lru_dirty);	/* FIXME: prefer seqlock instead of spinlock? */
 LIST_HEAD(ext2_nvm_inode_lru_clean);
 LIST_HEAD(ext2_nvm_block_lru_dirty);
 LIST_HEAD(ext2_nvm_block_lru_clean);
+
+DEFINE_SPINLOCK(ext2_nvm_inode_lock);
 
 static void ext2_nvm_inode_mark_clean(struct ext2_nvm_inode *);
 static void ext2_nvm_inode_mark_dirty(struct ext2_nvm_inode *);
@@ -295,10 +297,12 @@ ext2_nvm_inode_lookup(struct super_block *sb, ino_t ino)
 	struct ext2_nvm_inode *p = NULL;
 	struct hlist_node *nodep;
 
+	spin_lock(&ext2_nvm_inode_lock);
 	hlist_for_each_entry(p, nodep, hlist_head, hash) {
 		if (p->ino == ino)
 			break;
 	}
+	spin_unlock(&ext2_nvm_inode_lock);
 
 	return p;
 }
@@ -310,26 +314,35 @@ ext2_nvm_inode_add(struct super_block *sb, struct ext2_nvm_inode *inodep)
 	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
 	struct hlist_head *hlist_head = &nvmi->inode_htab[block_group];
 
+	spin_lock(&ext2_nvm_inode_lock);
 	hlist_add_head(&inodep->hash, hlist_head);
+	spin_unlock(&ext2_nvm_inode_lock);
 }
 
 static void
 ext2_nvm_inode_del(struct super_block *sb, struct ext2_nvm_inode *inodep)
 {
+	spin_lock(&ext2_nvm_inode_lock);
 	hlist_del_init(&inodep->hash);
+	spin_unlock(&ext2_nvm_inode_lock);
 }
 
 /* LRU list operations */
 static void ext2_nvm_inode_mark_dirty(struct ext2_nvm_inode *nvm_inode)
 {
+
+	spin_lock(&ext2_nvm_inode_lock);
 	list_del(&nvm_inode->lru);
 	list_add(&nvm_inode->lru, &ext2_nvm_inode_lru_dirty);
+	spin_unlock(&ext2_nvm_inode_lock);
 }
 
 static void ext2_nvm_inode_mark_clean(struct ext2_nvm_inode *nvm_inode)
 {
+	spin_lock(&ext2_nvm_inode_lock);
 	list_del(&nvm_inode->lru);
 	list_add_tail(&nvm_inode->lru, &ext2_nvm_inode_lru_clean);
+	spin_unlock(&ext2_nvm_inode_lock);
 }
 
 /* inode-related APIs */
