@@ -896,9 +896,10 @@ has_nvm:
 	if (test_opt(sb, NVM)) {
 		nvmi->es = ext2_nvm_zalloc(sizeof(*es));
 		ext2_super_block_clone(nvmi->es, es);
-		sbi->s_es = nvmi->es;
-	} else
-		sbi->s_es = es;
+		es = nvmi->es;
+	}
+
+	sbi->s_es = es;
 	sb->s_magic = le16_to_cpu(es->s_magic);
 
 	if (sb->s_magic != EXT2_SUPER_MAGIC)
@@ -998,9 +999,9 @@ has_nvm:
 			if (!nvmi->es)
 				es = ext2_nvm_zalloc(sizeof(*es));
 			ext2_super_block_clone(nvmi->es, es);
-			sbi->s_es = nvmi->es;
-		} else
-			sbi->s_es = es;
+			es = nvmi->es;
+		}
+		sbi->s_es = es;
 		if (es->s_magic != cpu_to_le16(EXT2_SUPER_MAGIC)) {
 			printk ("EXT2-fs: Magic mismatch, very weird !\n");
 			goto failed_mount;
@@ -1240,9 +1241,9 @@ static void ext2_commit_super (struct super_block * sb,
 static void ext2_sync_super(struct super_block *sb, struct ext2_super_block *es)
 {
 	if (test_opt(sb, NVM)) {
+		/* ex2_sync_super <=> ext2_nvm_write_super */
 		ext2_nvm_write_super(sb);
 	} else {
-		/* Old fashion */
 		es->s_free_blocks_count = cpu_to_le32(ext2_count_free_blocks(sb));
 		es->s_free_inodes_count = cpu_to_le32(ext2_count_free_inodes(sb));
 		es->s_wtime = cpu_to_le32(get_seconds());
@@ -1269,7 +1270,15 @@ static int ext2_sync_fs(struct super_block *sb, int wait)
 
 	lock_kernel();
 	if (test_opt(sb, NVM)) {
-		ext2_nvm_write_super(sb);
+		if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
+			ext2_debug("setting valid to 0\n");
+			es->s_state &= cpu_to_le16(~EXT2_VALID_FS);
+			/* Last mount time */
+			es->s_mtime = cpu_to_le32(get_seconds());
+			ext2_nvm_write_super(sb);
+		} else
+			/* Just commit if invalid */
+			es->s_wtime = cpu_to_le32(get_seconds());
 	} else {
 		/* Old fashion */
 		if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
@@ -1291,20 +1300,13 @@ static int ext2_sync_fs(struct super_block *sb, int wait)
 	return 0;
 }
 
+/* ext2_write_super <=> ext2_sync_fs in ext2 */
 void ext2_write_super(struct super_block *sb)
 {
-	if (test_opt(sb, NVM)) {
-		/* Just write into nvm */
-		if (!(sb->s_flags & MS_RDONLY))
-			ext2_nvm_write_super(sb);
-		else
-			sb->s_dirt = 0;
-	} else {
-		if (!(sb->s_flags & MS_RDONLY))
-			ext2_sync_fs(sb, 1);
-		else
-			sb->s_dirt = 0;
-	}
+	if (!(sb->s_flags & MS_RDONLY))
+		ext2_sync_fs(sb, 1);
+	else
+		sb->s_dirt = 0;
 }
 
 static int ext2_remount (struct super_block * sb, int * flags, char * data)

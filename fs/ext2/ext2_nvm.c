@@ -247,15 +247,12 @@ void ext2_nvm_write_super(struct super_block *sb)
 	struct ext2_super_block *es = EXT2_SB(sb)->s_es;
 
 	lock_kernel();
-	if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
-		ext2_debug("setting valid to 0\n");
-		es->s_state &= cpu_to_le16(~EXT2_VALID_FS);
-		es->s_free_blocks_count =
-			cpu_to_le32(ext2_count_free_blocks(sb));
-		es->s_free_inodes_count =
-			cpu_to_le32(ext2_count_free_inodes(sb));
-		es->s_mtime = cpu_to_le32(get_seconds());
-	}
+	es->s_free_blocks_count =
+		cpu_to_le32(ext2_count_free_blocks(sb));
+	es->s_free_inodes_count =
+		cpu_to_le32(ext2_count_free_inodes(sb));
+	/* Last write time */
+	es->s_wtime = cpu_to_le32(get_seconds());
 	sb->s_dirt = 0;
 	unlock_kernel();
 }
