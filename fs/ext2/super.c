@@ -146,6 +146,7 @@ static void ext2_put_super (struct super_block *sb)
 	percpu_counter_destroy(&sbi->s_freeblocks_counter);
 	percpu_counter_destroy(&sbi->s_freeinodes_counter);
 	percpu_counter_destroy(&sbi->s_dirs_counter);
+	/* Release buffer of super block */
 	brelse (sbi->s_sbh);
 
 	if (test_opt(sb, NVM))

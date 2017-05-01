@@ -78,8 +78,7 @@ int ext2_nvm_init(struct ext2_nvm_info *nvmi)
 	/* Aligned by sizeof(long) */
 	size_t reserved =
 		((2*sizeof(struct ext2_nvm_info))-1 / sizeof(long) + 1) * sizeof(long);
-	struct ext2_nvm_info *nvmi_fixed =
-		(struct ext2_nvm_info *) nvmi->virt_addr;
+	struct ext2_nvm_info *nvmi_fixed;
 	header_t *first_segement;
 
 	/* Map NVM to virtual address space with ioremmap */
@@ -89,6 +88,7 @@ int ext2_nvm_init(struct ext2_nvm_info *nvmi)
 		printk("EXT2-fs: ioremap of the nvm failed\n");
 		return 1;
 	}
+	nvmi_fixed = (struct ext2_nvm_info *) nvmi->virt_addr;
 
 	/* Move nvmi into nvm from memory instead */
 	/*
@@ -154,6 +154,11 @@ void ext2_nvm_quit(struct super_block *sb)
 	if (nvmi->es)
 		ext2_nvm_free(nvmi->es);
 
+	if (nvmi->virt_addr) {
+		ext2_nvm_iounmap(nvmi->virt_addr, nvmi->initsize);
+		release_mem_region(nvmi->phys_addr, nvmi->initsize);
+	}
+
 	kfree(nvmi);
 }
 
@@ -171,8 +176,7 @@ void ext2_nvm_sync_sb(struct super_block *sb)
 	es = (struct ext2_super_block *) (((char *) bh->b_data) + offset);
 	ext2_super_block_clone(es, nvmi->es);
 	mark_buffer_dirty(bh);
-	sync_dirty_buffer(bh);
-	brelse(bh);
+	/*sync_dirty_buffer(bh);*/
 }
 
 void ext2_nvm_sync_gd(struct super_block *sb)
@@ -188,8 +192,7 @@ void ext2_nvm_sync_gd(struct super_block *sb)
 		if (nvmi->group_desc[i]) {
 			ext2_group_desc_clone(gdp, nvmi->group_desc[i]);
 			mark_buffer_dirty(bh);
-			sync_dirty_buffer(bh);
-			brelse(bh);
+			/*sync_dirty_buffer(bh);*/
 		}
 	}
 }
