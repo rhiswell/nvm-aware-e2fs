@@ -262,7 +262,6 @@ struct ext2_group_desc *ext2_nvm_get_group_desc(struct super_block *sb,
 						struct buffer_head **bh)
 {
 	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
-	struct ext2_group_desc *gdp;
 	struct ext2_sb_info *sbi = EXT2_SB(sb);
 
 	if (block_group >= sbi->s_groups_count) {
