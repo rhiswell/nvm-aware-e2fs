@@ -1178,13 +1178,11 @@ Egdp:
 static struct ext2_inode *ext2_get_inode(struct super_block *sb, ino_t ino,
 					struct buffer_head **p)
 {
-	/*
 	if (test_opt(sb, NVM))
 		return ext2_nvm_get_inode(sb, ino, p);
 	else
 		return __ext2_get_inode(sb, ino, p);
-	*/
-	return __ext2_get_inode(sb, ino, p);
+	/*return __ext2_get_inode(sb, ino, p);*/
 }
 
 void ext2_set_inode_flags(struct inode *inode)
@@ -1453,13 +1451,11 @@ int __ext2_write_inode(struct inode *inode, int do_sync)
 
 int ext2_write_inode(struct inode *inode, int do_sync)
 {
-	/*
 	if (test_opt(inode->i_sb, NVM))
 		return ext2_nvm_write_inode(inode, do_sync);
 	else
 		return __ext2_write_inode(inode, do_sync);
-	*/
-	return __ext2_write_inode(inode, do_sync);
+	/*return __ext2_write_inode(inode, do_sync);*/
 }
 
 int ext2_sync_inode(struct inode *inode)

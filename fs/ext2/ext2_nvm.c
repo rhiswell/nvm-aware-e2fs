@@ -312,27 +312,33 @@ ext2_nvm_inode_install(struct super_block *sb, struct ext2_nvm_inode *inodep)
 static void
 ext2_nvm_inode_del(struct super_block *sb, struct ext2_nvm_inode *inodep)
 {
-	spin_lock(&ext2_nvm_inode_lock);
+	/*spin_lock(&ext2_nvm_inode_lock);*/
+	lock_kernel();
 	hlist_del_init(&inodep->hash);
-	spin_unlock(&ext2_nvm_inode_lock);
+	unlock_kernel();
+	/*spin_unlock(&ext2_nvm_inode_lock);*/
 }
 
 /* LRU list operations */
 static void ext2_nvm_inode_mark_dirty(struct ext2_nvm_inode *nvm_inode)
 {
 
-	spin_lock(&ext2_nvm_inode_lock);
+	/*spin_lock(&ext2_nvm_inode_lock);*/
+	lock_kernel();
 	list_del(&nvm_inode->lru);
 	list_add(&nvm_inode->lru, &ext2_nvm_inode_lru_dirty);
-	spin_unlock(&ext2_nvm_inode_lock);
+	unlock_kernel();
+	/*spin_unlock(&ext2_nvm_inode_lock);*/
 }
 
 static void ext2_nvm_inode_mark_clean(struct ext2_nvm_inode *nvm_inode)
 {
-	spin_lock(&ext2_nvm_inode_lock);
+	/*spin_lock(&ext2_nvm_inode_lock);*/
+	lock_kernel();
 	list_del(&nvm_inode->lru);
 	list_add_tail(&nvm_inode->lru, &ext2_nvm_inode_lru_clean);
-	spin_unlock(&ext2_nvm_inode_lock);
+	unlock_kernel();
+	/*spin_unlock(&ext2_nvm_inode_lock);*/
 }
 
 static void ext2_nvm_inode_insert_clean(struct super_block *sb,
@@ -340,9 +346,11 @@ static void ext2_nvm_inode_insert_clean(struct super_block *sb,
 {
 
 
-	spin_lock(&ext2_nvm_inode_lock);
+	/*spin_lock(&ext2_nvm_inode_lock);*/
+	lock_kernel();
 	list_add(&nvm_inode->lru, &ext2_nvm_inode_lru_clean);
-	spin_unlock(&ext2_nvm_inode_lock);
+	unlock_kernel();
+	/*spin_unlock(&ext2_nvm_inode_lock);*/
 
 	/* Insert into the hash table of nvm inodes */
 	ext2_nvm_inode_install(sb, nvm_inode);
@@ -357,6 +365,7 @@ struct ext2_inode *ext2_nvm_get_inode(struct super_block *sb, ino_t ino,
 	struct ext2_inode *retp = NULL;
 	/* The raw inode doesn't stay in NVM, then we cache it */
 	if (!nvm_inodep) {
+		lock_kernel();
 		nvm_inodep = ext2_nvm_zalloc(sizeof(struct ext2_nvm_inode));
 		if (!nvm_inodep) {
 			printk("EXT2-fs: not enough memory on NVM\n");
@@ -369,6 +378,7 @@ struct ext2_inode *ext2_nvm_get_inode(struct super_block *sb, ino_t ino,
 			goto failure;
 		}
 		ext2_inode_clone(&nvm_inodep->raw_inode, retp);
+		unlock_kernel();
 
 		/* Insert into clean lru */
 		ext2_nvm_inode_insert_clean(sb, nvm_inodep);
