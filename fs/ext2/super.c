@@ -814,6 +814,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 	int i, j;
 	__le32 features;
 	int err;
+	struct ext2_group_desc *gdp;
 
 	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
 	if (!sbi)
@@ -1122,6 +1123,18 @@ has_nvm:
 				brelse (sbi->s_group_desc[j]);
 			printk ("EXT2-fs: unable to read group descriptors\n");
 			goto failed_mount_group_desc;
+		}
+	}
+	/* Copy gds into NVM */
+	if (test_opt(sb, NVM)) {
+		for (i = 0; i < sbi->s_groups_count; ++i) {
+			nvmi->group_desc[i] = ext2_nvm_zalloc(sizeof(*gdp));
+			if (nvmi->group_desc[i] == NULL) {
+				printk("EXT2-fs: not enough memory on NVM\n");
+				goto failed_mount2;
+			}
+			gdp = __ext2_get_group_desc(sb, i, NULL);
+			ext2_group_desc_clone(nvmi->group_desc[i], gdp);
 		}
 	}
 	if (!ext2_check_descriptors (sb)) {

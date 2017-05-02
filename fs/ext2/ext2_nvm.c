@@ -274,17 +274,7 @@ struct ext2_group_desc *ext2_nvm_get_group_desc(struct super_block *sb,
 		return NULL;
 	}
 
-	/* Demand-caching group descriptors on NVM */
-	if (nvmi->group_desc[block_group] == NULL) {
-		nvmi->group_desc[block_group] =
-			(struct ext2_group_desc *) ext2_nvm_zalloc(sizeof(*gdp));
-		gdp = __ext2_get_group_desc(sb, block_group, bh);
-		/* Copy gd from buffer into NVM */
-		ext2_group_desc_clone(nvmi->group_desc[block_group], gdp);
-	}
-	gdp = nvmi->group_desc[block_group];
-
-	return gdp;
+	return nvmi->group_desc[block_group];
 }
 
 /* Hash list operations */
