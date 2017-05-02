@@ -848,6 +848,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
 		/* ext2 compatible flag: EXT2_MOUNT_NVM <=> nvmi->isalive */
 		set_opt(sbi->s_mount_opt, NVM);
 		sb->s_fs_nvmi = nvmi;
+		printk("EXT2-fs: nvm-aware mode is enabled\n");
 		goto has_nvm;
 	}
 nil_nvm:

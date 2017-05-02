@@ -2,8 +2,8 @@
 # Makefile for the linux ext2-filesystem routines.
 #
 
-CFLAGS := $(filter-out -O2, $(CFLAGS))
-CFLAGS += O0
+EXTRA_CFLAGS := $(filter-out -O2, $(CFLAGS))
+EXTRA_CFLAGS += -O0
 
 obj-$(CONFIG_EXT2_FS) += ext2.o
 

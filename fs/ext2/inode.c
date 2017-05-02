@@ -1334,7 +1334,8 @@ struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
 			init_special_inode(inode, inode->i_mode,
 			   new_decode_dev(le32_to_cpu(raw_inode->i_block[1])));
 	}
-	brelse (bh);
+	if (!test_opt(sb, NVM))
+		brelse(bh);
 	ext2_set_inode_flags(inode);
 	unlock_new_inode(inode);
 	return inode;

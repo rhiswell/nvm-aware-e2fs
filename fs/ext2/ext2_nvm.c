@@ -138,7 +138,7 @@ void ext2_nvm_quit(struct super_block *sb)
 	struct ext2_sb_info *sbi = EXT2_SB(sb);
 	struct ext2_nvm_inode *p, *tp;
 
-	list_for_each_entry_safe(p, tp, &ext2_nvm_block_lru_clean, lru) {
+	list_for_each_entry_safe(p, tp, &ext2_nvm_inode_lru_clean, lru) {
 		list_del(&p->lru);
 		ext2_nvm_free(p);
 	}
@@ -213,32 +213,39 @@ void ext2_nvm_sync_inode(struct super_block *sb)
 	struct ext2_inode *raw_inode;
 	struct ext2_nvm_inode *p, *tp;
 
-	list_for_each_entry_safe(p, tp, &ext2_nvm_block_lru_dirty, lru) {
+	list_for_each_entry_safe(p, tp, &ext2_nvm_inode_lru_dirty, lru) {
 		raw_inode = __ext2_get_inode(sb, p->ino, &bh);
 		ext2_inode_clone(raw_inode, &p->raw_inode);
 		mark_buffer_dirty(bh);
-		sync_dirty_buffer(bh);
+		/*
+		 * Functions like sync_blkdev will flush all dirty buffers
+		 * into disk, so we avoid syncing each time here.
+		 */
+		/*sync_dirty_buffer(bh);*/
 		brelse(bh);
 		/*
-		 * This function will remove p from the dirty lru into clean lru,
-		 * so we must use list_for_each_entry_safe to iter the list.
+		 * This function will remove p from the dirty lru and insert
+		 * into clean lru. Besides, we must use
+		 * list_for_each_entry_safe to iter the list since the
+		 * following operations will change the list.
 		 */
 		ext2_nvm_inode_mark_clean(p);
 	}
 }
 
 /*
- * Copy data from NVM to corresponding buffer and mark_buffer_dirty(bh). And we
- * should use mark_nvm_dirty instead of mark_buffer_dirty in normal routine.
+ * Copy data from NVM to corresponding buffer and mark_buffer_dirty(bh).
+ * IMPORTANT: we should use mark_nvm_dirty instead of mark_buffer_dirty
+ * in normal routine.
  */
 void ext2_nvm_sync(struct super_block *sb)
 {
 	ext2_nvm_sync_sb(sb);
 	ext2_nvm_sync_gd(sb);
+	ext2_nvm_sync_inode(sb);
 	/* TODOs */
 	ext2_nvm_sync_inode_bm(sb);
 	ext2_nvm_sync_block_bm(sb);
-	ext2_nvm_sync_inode(sb);
 }
 
 /* hasnvm => sbi->es = sb->s_fs_nvmi->es */
@@ -283,13 +290,15 @@ ext2_nvm_inode_lookup(struct super_block *sb, ino_t ino)
 	unsigned long block_group = (ino-1) / EXT2_INODES_PER_GROUP(sb);
 	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
 	struct hlist_head *hlist_head = &nvmi->inode_htab[block_group];
-	struct ext2_nvm_inode *p = NULL;
+	struct ext2_nvm_inode *tp, *p = NULL;
 	struct hlist_node *nodep;
 
 	spin_lock(&ext2_nvm_inode_lock);
-	hlist_for_each_entry(p, nodep, hlist_head, hash) {
-		if (p->ino == ino)
+	hlist_for_each_entry(tp, nodep, hlist_head, hash) {
+		if (tp->ino == ino) {
+			p = tp;
 			break;
+		}
 	}
 	spin_unlock(&ext2_nvm_inode_lock);
 
@@ -311,33 +320,27 @@ ext2_nvm_inode_install(struct super_block *sb, struct ext2_nvm_inode *inodep)
 static void
 ext2_nvm_inode_del(struct super_block *sb, struct ext2_nvm_inode *inodep)
 {
-	/*spin_lock(&ext2_nvm_inode_lock);*/
-	lock_kernel();
+	spin_lock(&ext2_nvm_inode_lock);
 	hlist_del_init(&inodep->hash);
-	unlock_kernel();
-	/*spin_unlock(&ext2_nvm_inode_lock);*/
+	spin_unlock(&ext2_nvm_inode_lock);
 }
 
 /* LRU list operations */
 static void ext2_nvm_inode_mark_dirty(struct ext2_nvm_inode *nvm_inode)
 {
 
-	/*spin_lock(&ext2_nvm_inode_lock);*/
-	lock_kernel();
+	spin_lock(&ext2_nvm_inode_lock);
 	list_del(&nvm_inode->lru);
 	list_add(&nvm_inode->lru, &ext2_nvm_inode_lru_dirty);
-	unlock_kernel();
-	/*spin_unlock(&ext2_nvm_inode_lock);*/
+	spin_unlock(&ext2_nvm_inode_lock);
 }
 
 static void ext2_nvm_inode_mark_clean(struct ext2_nvm_inode *nvm_inode)
 {
-	/*spin_lock(&ext2_nvm_inode_lock);*/
-	lock_kernel();
+	spin_lock(&ext2_nvm_inode_lock);
 	list_del(&nvm_inode->lru);
 	list_add_tail(&nvm_inode->lru, &ext2_nvm_inode_lru_clean);
-	unlock_kernel();
-	/*spin_unlock(&ext2_nvm_inode_lock);*/
+	spin_unlock(&ext2_nvm_inode_lock);
 }
 
 static void ext2_nvm_inode_insert_clean(struct super_block *sb,
@@ -345,11 +348,9 @@ static void ext2_nvm_inode_insert_clean(struct super_block *sb,
 {
 
 
-	/*spin_lock(&ext2_nvm_inode_lock);*/
-	lock_kernel();
+	spin_lock(&ext2_nvm_inode_lock);
 	list_add(&nvm_inode->lru, &ext2_nvm_inode_lru_clean);
-	unlock_kernel();
-	/*spin_unlock(&ext2_nvm_inode_lock);*/
+	spin_unlock(&ext2_nvm_inode_lock);
 
 	/* Insert into the hash table of nvm inodes */
 	ext2_nvm_inode_install(sb, nvm_inode);
@@ -365,23 +366,35 @@ struct ext2_inode *ext2_nvm_get_inode(struct super_block *sb, ino_t ino,
 	/* The raw inode doesn't stay in NVM, then we cache it */
 	if (!nvm_inodep) {
 		lock_kernel();
+		/* The inode maybe loaded in other routine */
+		nvm_inodep = ext2_nvm_inode_lookup(sb, ino);
+		if (nvm_inodep) {
+			unlock_kernel();
+			goto got;
+		}
 		nvm_inodep = ext2_nvm_zalloc(sizeof(struct ext2_nvm_inode));
 		if (!nvm_inodep) {
 			printk("EXT2-fs: not enough memory on NVM\n");
 			goto failure;
 		}
 		nvm_inodep->ino = ino;
+		/*
+		 * bh->b_count = 2 since that per_cpu_lru will also bh_get(bh).
+		 * And here will cause sleep that we shouldn't use spinlock.
+		 */
 		retp = __ext2_get_inode(sb, ino, p);
 		if (IS_ERR(retp)) {
 			ext2_nvm_free(nvm_inodep);
 			goto failure;
 		}
 		ext2_inode_clone(&nvm_inodep->raw_inode, retp);
-		unlock_kernel();
+		brelse(*p);
 
 		/* Insert into clean lru */
 		ext2_nvm_inode_insert_clean(sb, nvm_inodep);
+		unlock_kernel();
 	}
+got:
 	retp = &nvm_inodep->raw_inode;
 failure:
 	return retp;
@@ -394,7 +407,8 @@ int ext2_nvm_write_inode(struct inode *inode, int do_sync)
 	ino_t ino = inode->i_ino;
 	uid_t uid = inode->i_uid;
 	gid_t gid = inode->i_gid;
-	struct ext2_inode * raw_inode = ext2_nvm_get_inode(sb, ino, NULL);
+	struct buffer_head *bh;
+	struct ext2_inode * raw_inode = ext2_nvm_get_inode(sb, ino, &bh);
 	struct ext2_nvm_inode *nvm_inode = EXT2_NVM_I(raw_inode);
 	int n;
 	int err = 0;
