@@ -1,0 +1,1837 @@
+From 2108a6bdc69fd8ef2261a533f8b72d7fd07a5dc0 Mon Sep 17 00:00:00 2001
+From: Raymond He <rhiswell@gmail.com>
+Date: Sun, 23 Apr 2017 23:04:21 +0800
+Subject: [PATCH] ext2: add NVM-aware option for ext2fs that can use NVM to
+ improve IO performance.
+
+All the metadata of Ext2 are cached by PMEM (NVM backed) without writing back to disk.
+The result shows that nvm-aware Ext2 can improve disk IO Throughput and reduce write
+latecy slightly in a particular scene. Currently, the NVM is emulated on reserved DRAM.
+---
+ fs/buffer.c                 |  32 ++-
+ fs/ext2/Makefile            |   5 +-
+ fs/ext2/balloc.c            |  42 ++-
+ fs/ext2/ext2.h              |  14 +-
+ fs/ext2/ext2_nvm.c          | 501 ++++++++++++++++++++++++++++++++++++
+ fs/ext2/ext2_nvm.h          |  32 +++
+ fs/ext2/ialloc.c            |  58 +++--
+ fs/ext2/inode.c             |  35 ++-
+ fs/ext2/namei.c             |   6 +-
+ fs/ext2/super.c             | 237 ++++++++++++++---
+ include/linux/ext2_fs.h     |  26 +-
+ include/linux/ext2_fs_nvm.h |  63 +++++
+ include/linux/ext2_fs_sb.h  |   1 +
+ include/linux/fs.h          |  19 +-
+ 14 files changed, 965 insertions(+), 106 deletions(-)
+ create mode 100644 fs/ext2/ext2_nvm.c
+ create mode 100644 fs/ext2/ext2_nvm.h
+ create mode 100644 include/linux/ext2_fs_nvm.h
+
+diff --git a/fs/buffer.c b/fs/buffer.c
+index 6fa53025..004eb75e 100644
+--- a/fs/buffer.c
++++ b/fs/buffer.c
+@@ -111,6 +111,10 @@ static int quiet_error(struct buffer_head *bh)
+ }
+ 
+ 
++/*
++ * FIXME: e.g. buffer I/O error on device uba2, logical block 5133
++ * && end_request: I/O error, dev uba, sector 30780840
++ */
+ static void buffer_io_error(struct buffer_head *bh)
+ {
+ 	char b[BDEVNAME_SIZE];
+@@ -243,7 +247,7 @@ out:
+    Thus invalidate_buffers in general usage is not allwowed to trash
+    dirty buffers. For example ioctl(FLSBLKBUF) expects dirty data to
+    be preserved.  These buffers are simply skipped.
+-  
++
+    We also skip buffers which are still in use.  For example this can
+    happen if a userspace program is reading the block device.
+ 
+@@ -475,7 +479,7 @@ EXPORT_SYMBOL(mark_buffer_async_write);
+  * try_to_free_buffers() will be operating against the *blockdev* mapping
+  * at the time, not against the S_ISREG file which depends on those buffers.
+  * So the locking for private_list is via the private_lock in the address_space
+- * which backs the buffers.  Which is different from the address_space 
++ * which backs the buffers.  Which is different from the address_space
+  * against which the buffers are listed.  So for a particular address_space,
+  * mapping->private_lock does *not* protect mapping->private_list!  In fact,
+  * mapping->private_list will always be protected by the backing blockdev's
+@@ -745,7 +749,7 @@ EXPORT_SYMBOL(__set_page_dirty_buffers);
+  * Do this in two main stages: first we copy dirty buffers to a
+  * temporary inode list, queueing the writes as we go.  Then we clean
+  * up, waiting for those writes to complete.
+- * 
++ *
+  * During this second stage, any subsequent updates to the file may end
+  * up refiling the buffer on the original inode's dirty list again, so
+  * there is a chance we will end up with a buffer queued for write but
+@@ -820,7 +824,7 @@ static int fsync_buffers_list(spinlock_t *lock, struct list_head *list)
+ 		brelse(bh);
+ 		spin_lock(lock);
+ 	}
+-	
++
+ 	spin_unlock(lock);
+ 	err2 = osync_buffers_list(lock, list);
+ 	if (err)
+@@ -936,7 +940,7 @@ no_grow:
+ 	/*
+ 	 * Return failure for non-async IO requests.  Async IO requests
+ 	 * are not allowed to fail, so we have to wait until buffer heads
+-	 * become available.  But we don't want tasks sleeping with 
++	 * become available.  But we don't want tasks sleeping with
+ 	 * partially complete buffers, so all were released above.
+ 	 */
+ 	if (!retry)
+@@ -945,7 +949,7 @@ no_grow:
+ 	/* We're _really_ low on memory. Now we just
+ 	 * wait for old buffer heads to become free due to
+ 	 * finishing IO.  Since this is an async request and
+-	 * the reserve list is empty, we're sure there are 
++	 * the reserve list is empty, we're sure there are
+ 	 * async buffer heads in use.
+ 	 */
+ 	free_more_memory();
+@@ -969,7 +973,7 @@ link_dev_buffers(struct page *page, struct buffer_head *head)
+ 
+ /*
+  * Initialise the state of a blockdev page's buffers.
+- */ 
++ */
+ static void
+ init_page_buffers(struct page *page, struct block_device *bdev,
+ 			sector_t block, int size)
+@@ -1411,7 +1415,7 @@ EXPORT_SYMBOL(__breadahead);
+  *  @bdev: the block_device to read from
+  *  @block: number of block
+  *  @size: size (in bytes) to read
+- * 
++ *
+  *  Reads a specified block, and returns buffer head that contains it.
+  *  It returns NULL if the block was unreadable.
+  */
+@@ -1442,7 +1446,7 @@ static void invalidate_bh_lru(void *arg)
+ 	}
+ 	put_cpu_var(bh_lrus);
+ }
+-	
++
+ void invalidate_bh_lrus(void)
+ {
+ 	on_each_cpu(invalidate_bh_lru, NULL, 1);
+@@ -1899,7 +1903,7 @@ static int __block_prepare_write(struct inode *inode, struct page *page,
+ 		if (PageUptodate(page)) {
+ 			if (!buffer_uptodate(bh))
+ 				set_buffer_uptodate(bh);
+-			continue; 
++			continue;
+ 		}
+ 		if (!buffer_uptodate(bh) && !buffer_delay(bh) &&
+ 		    !buffer_unwritten(bh) &&
+@@ -2232,7 +2236,7 @@ EXPORT_SYMBOL(block_read_full_page);
+ 
+ /* utility function for filesystems that need to do work on expanding
+  * truncates.  Uses filesystem pagecache writes to allow the filesystem to
+- * deal with the hole.  
++ * deal with the hole.
+  */
+ int generic_cont_expand_simple(struct inode *inode, loff_t size)
+ {
+@@ -2807,7 +2811,7 @@ int block_truncate_page(struct address_space *mapping,
+ 
+ 	length = blocksize - length;
+ 	iblock = (sector_t)index << (PAGE_CACHE_SHIFT - inode->i_blkbits);
+-	
++
+ 	page = grab_cache_page(mapping, index);
+ 	err = -ENOMEM;
+ 	if (!page)
+@@ -3018,7 +3022,7 @@ EXPORT_SYMBOL(submit_bh);
+  *
+  * ll_rw_block sets b_end_io to simple completion handler that marks
+  * the buffer up-to-date (if approriate), unlocks the buffer and wakes
+- * any waiters. 
++ * any waiters.
+  *
+  * All of the buffers must be for the same device, and must also be a
+  * multiple of the current approved size for the device.
+@@ -3262,7 +3266,7 @@ static void recalc_bh_state(void)
+ 		tot += per_cpu(bh_accounting, i).nr;
+ 	buffer_heads_over_limit = (tot > max_buffer_heads);
+ }
+-	
++
+ struct buffer_head *alloc_buffer_head(gfp_t gfp_flags)
+ {
+ 	struct buffer_head *ret = kmem_cache_alloc(bh_cachep, gfp_flags);
+diff --git a/fs/ext2/Makefile b/fs/ext2/Makefile
+index f42af45c..07cf3207 100644
+--- a/fs/ext2/Makefile
++++ b/fs/ext2/Makefile
+@@ -2,10 +2,13 @@
+ # Makefile for the linux ext2-filesystem routines.
+ #
+ 
++EXTRA_CFLAGS := $(filter-out -O2, $(CFLAGS))
++EXTRA_CFLAGS += -O0
++
+ obj-$(CONFIG_EXT2_FS) += ext2.o
+ 
+ ext2-y := balloc.o dir.o file.o ialloc.o inode.o \
+-	  ioctl.o namei.o super.o symlink.o
++	  ioctl.o namei.o super.o symlink.o ext2_nvm.o
+ 
+ ext2-$(CONFIG_EXT2_FS_XATTR)	 += xattr.o xattr_user.o xattr_trusted.o
+ ext2-$(CONFIG_EXT2_FS_POSIX_ACL) += acl.o
+diff --git a/fs/ext2/balloc.c b/fs/ext2/balloc.c
+index 7f8d2e5a..6205fb2c 100644
+--- a/fs/ext2/balloc.c
++++ b/fs/ext2/balloc.c
+@@ -11,11 +11,12 @@
+  *        David S. Miller (davem@caip.rutgers.edu), 1995
+  */
+ 
+-#include "ext2.h"
+ #include <linux/quotaops.h>
+ #include <linux/sched.h>
+ #include <linux/buffer_head.h>
+ #include <linux/capability.h>
++#include "ext2.h"
++#include "ext2_nvm.h"
+ 
+ /*
+  * balloc.c contains the blocks allocation and deallocation routines
+@@ -35,7 +36,7 @@
+ 
+ #define in_range(b, first, len)	((b) >= (first) && (b) <= (first) + (len) - 1)
+ 
+-struct ext2_group_desc * ext2_get_group_desc(struct super_block * sb,
++struct ext2_group_desc * __ext2_get_group_desc(struct super_block * sb,
+ 					     unsigned int block_group,
+ 					     struct buffer_head ** bh)
+ {
+@@ -69,6 +70,16 @@ struct ext2_group_desc * ext2_get_group_desc(struct super_block * sb,
+ 	return desc + offset;
+ }
+ 
++struct ext2_group_desc *ext2_get_group_desc(struct super_block * sb,
++					     unsigned int block_group,
++					     struct buffer_head ** bh)
++{
++	if (test_opt(sb, NVM))
++		return ext2_nvm_get_group_desc(sb, block_group, bh);
++	else
++		return __ext2_get_group_desc(sb, block_group, bh);
++}
++
+ static int ext2_valid_block_bitmap(struct super_block *sb,
+ 					struct ext2_group_desc *desc,
+ 					unsigned int block_group,
+@@ -168,7 +179,7 @@ static void release_blocks(struct super_block *sb, int count)
+ 	}
+ }
+ 
+-static void group_adjust_blocks(struct super_block *sb, int group_no,
++static void __group_adjust_blocks(struct super_block *sb, int group_no,
+ 	struct ext2_group_desc *desc, struct buffer_head *bh, int count)
+ {
+ 	if (count) {
+@@ -184,6 +195,25 @@ static void group_adjust_blocks(struct super_block *sb, int group_no,
+ 	}
+ }
+ 
++static void group_adjust_blocks(struct super_block *sb, int group_no,
++	struct ext2_group_desc *desc, struct buffer_head *bh, int count)
++{
++	if (test_opt(sb, NVM)) {
++		/* In NVM mode, desc points to NVM that is a copy of that in buffer */
++		if (count) {
++			struct ext2_sb_info *sbi = EXT2_SB(sb);
++			unsigned free_blocks;
++
++			spin_lock(sb_bgl_lock(sbi, group_no));
++			free_blocks = le16_to_cpu(desc->bg_free_blocks_count);
++			desc->bg_free_blocks_count = cpu_to_le16(free_blocks + count);
++			spin_unlock(sb_bgl_lock(sbi, group_no));
++			sb->s_dirt = 1;
++		}
++	} else
++		__group_adjust_blocks(sb, group_no, desc, bh, count);
++}
++
+ /*
+  * The reservation window structure operations
+  * --------------------------------------------
+@@ -614,7 +644,7 @@ find_next_usable_block(int start, struct buffer_head *bh, int maxblocks)
+ 
+ 	if (start > 0) {
+ 		/*
+-		 * The goal was occupied; search forward for a free 
++		 * The goal was occupied; search forward for a free
+ 		 * block within the next XX blocks.
+ 		 *
+ 		 * end_goal is more or less random, but it has to be
+@@ -1209,7 +1239,7 @@ static int ext2_has_free_blocks(struct ext2_sb_info *sbi)
+  *
+  * ext2_new_blocks uses a goal block to assist allocation.  If the goal is
+  * free, or there is a free block within 32 blocks of the goal, that block
+- * is allocated.  Otherwise a forward search is made for a free block; within 
++ * is allocated.  Otherwise a forward search is made for a free block; within
+  * each block group the search first looks for an entire free byte in the block
+  * bitmap, and then for any free bit if that fails.
+  * This function also updates quota and i_blocks field.
+@@ -1473,7 +1503,7 @@ unsigned long ext2_count_free_blocks (struct super_block * sb)
+ 		bitmap_bh = read_block_bitmap(sb, i);
+ 		if (!bitmap_bh)
+ 			continue;
+-		
++
+ 		x = ext2_count_free(bitmap_bh, sb->s_blocksize);
+ 		printk ("group %d: stored = %d, counted = %lu\n",
+ 			i, le16_to_cpu(desc->bg_free_blocks_count), x);
+diff --git a/fs/ext2/ext2.h b/fs/ext2/ext2.h
+index 9a8a8e27..fb5cae32 100644
+--- a/fs/ext2/ext2.h
++++ b/fs/ext2/ext2.h
+@@ -1,5 +1,7 @@
++
+ #include <linux/fs.h>
+ #include <linux/ext2_fs.h>
++#include <linux/ext2_fs_nvm.h>
+ 
+ /*
+  * ext2 mount options
+@@ -91,6 +93,9 @@ extern void ext2_free_blocks (struct inode *, unsigned long,
+ extern unsigned long ext2_count_free_blocks (struct super_block *);
+ extern unsigned long ext2_count_dirs (struct super_block *);
+ extern void ext2_check_blocks_bitmap (struct super_block *);
++extern struct ext2_group_desc *__ext2_get_group_desc(struct super_block * sb,
++							unsigned int block_group,
++							struct buffer_head ** bh);
+ extern struct ext2_group_desc * ext2_get_group_desc(struct super_block * sb,
+ 						    unsigned int block_group,
+ 						    struct buffer_head ** bh);
+@@ -128,9 +133,11 @@ extern void ext2_set_inode_flags(struct inode *inode);
+ extern void ext2_get_inode_flags(struct ext2_inode_info *);
+ extern int ext2_fiemap(struct inode *inode, struct fiemap_extent_info *fieinfo,
+ 		       u64 start, u64 len);
+-int __ext2_write_begin(struct file *file, struct address_space *mapping,
+-		loff_t pos, unsigned len, unsigned flags,
+-		struct page **pagep, void **fsdata);
++extern int __ext2_write_begin(struct file *file, struct address_space *mapping,
++			loff_t pos, unsigned len, unsigned flags,
++			struct page **pagep, void **fsdata);
++extern struct ext2_inode *__ext2_get_inode(struct super_block *sb, ino_t ino,
++						struct buffer_head **p);
+ 
+ /* ioctl.c */
+ extern long ext2_ioctl(struct file *, unsigned int, unsigned long);
+@@ -178,3 +185,4 @@ ext2_group_first_block_no(struct super_block *sb, unsigned long group_no)
+ 	return group_no * (ext2_fsblk_t)EXT2_BLOCKS_PER_GROUP(sb) +
+ 		le32_to_cpu(EXT2_SB(sb)->s_es->s_first_data_block);
+ }
++
+diff --git a/fs/ext2/ext2_nvm.c b/fs/ext2/ext2_nvm.c
+new file mode 100644
+index 00000000..cf43a484
+--- /dev/null
++++ b/fs/ext2/ext2_nvm.c
+@@ -0,0 +1,501 @@
++
++#include <linux/kernel.h>
++#include <linux/ctype.h>
++#include <linux/types.h>
++#include <linux/fs.h>
++#include <linux/mm.h>
++#include <linux/io.h>
++#include <linux/string.h>
++#include <linux/buffer_head.h>
++#include <linux/smp_lock.h>
++#include <linux/highuid.h>
++#include "ext2.h"
++#include "ext2_nvm.h"
++
++LIST_HEAD(ext2_nvm_inode_lru_dirty);	/* FIXME: prefer seqlock instead of spinlock? */
++LIST_HEAD(ext2_nvm_inode_lru_clean);
++LIST_HEAD(ext2_nvm_block_lru_dirty);
++LIST_HEAD(ext2_nvm_block_lru_clean);
++
++DEFINE_SPINLOCK(ext2_nvm_inode_lock);
++
++static void ext2_nvm_inode_mark_clean(struct ext2_nvm_inode *);
++static void ext2_nvm_inode_mark_dirty(struct ext2_nvm_inode *);
++
++void *ext2_nvm_ioremap(phys_addr_t phys_addr, ssize_t size)
++{
++	void __iomem *retval;
++
++	retval = (void __iomem *)
++		request_mem_region_exclusive(phys_addr, size, "ext2_nvm");
++	if (!retval)
++		goto fail;
++
++	retval = ioremap_cache(phys_addr, size);
++
++fail:
++	return (void __force *) retval;
++}
++
++int ext2_nvm_iounmap(void *virt_addr, ssize_t size)
++{
++	iounmap((void __iomem __force *) virt_addr);
++	return 0;
++}
++
++phys_addr_t ext2_nvm_get_phys_addr(void **data)
++{
++	phys_addr_t phys_addr;
++	char *options = (char *) *data;
++
++	if (!options || strncmp(options, "physaddr=", 9) != 0)
++		return (phys_addr_t) ULLONG_MAX;
++	options += 9;
++	phys_addr = (phys_addr_t) simple_strtoull(options, &options, 0);
++	if (*options && *options != ',') {
++		printk(KERN_ERR "Invalid phys addr specification: %s\n",
++		       (char *) *data);
++		return (phys_addr_t) ULLONG_MAX;
++	}
++	if (phys_addr & (PAGE_SIZE - 1)) {
++		printk(KERN_ERR "physical address 0x%16llx for pmfs isn't "
++		       "aligned to a page boundary\n", (u64) phys_addr);
++		return (phys_addr_t) ULLONG_MAX;
++	}
++	if (*options == ',')
++		options++;
++	*data = (void *) options;
++	return phys_addr;
++}
++
++header_t *ext2_nvm_init_segement(void *start, unsigned long size)
++{
++	return NULL;
++}
++
++int ext2_nvm_init(struct ext2_nvm_info *nvmi)
++{
++	/* Aligned by sizeof(long) */
++	size_t reserved =
++		((2*sizeof(struct ext2_nvm_info))-1 / sizeof(long) + 1) * sizeof(long);
++	struct ext2_nvm_info *nvmi_fixed;
++	header_t *first_segement;
++
++	/* Map NVM to virtual address space with ioremmap */
++	nvmi->virt_addr = ext2_nvm_ioremap(nvmi->phys_addr, nvmi->initsize);
++
++	if (!nvmi->virt_addr) {
++		printk("EXT2-fs: ioremap of the nvm failed\n");
++		return 1;
++	}
++	nvmi_fixed = (struct ext2_nvm_info *) nvmi->virt_addr;
++
++	/* Move nvmi into nvm from memory instead */
++	/*
++	nvmi_fixed->initsize = nvmi->initsize;
++	nvmi_fixed->phys_addr = nvmi->phys_addr;
++	nvmi_fixed->virt_addr = nvmi->virt_addr;
++	kfree(nvmi);
++	nvmi = nvmi_fixed;
++	*/
++
++	/* Initialize the nvm allocator with first fit strategy */
++	/*
++	nvmi->basep = nvmi->virt_addr + reserved;
++	first_segement =
++		ext2_nvm_init_segement(nvmi->basep, nvmi->initsize - reserved);
++	if (!first_segement)
++		return 1;
++	*/
++
++	return 0;
++}
++
++void *ext2_nvm_malloc(size_t size)
++{
++	return kmalloc(size, GFP_KERNEL);
++}
++
++void *ext2_nvm_zalloc(size_t size)
++{
++	return kzalloc(size, GFP_KERNEL);
++}
++
++void *ext2_nvm_calloc(size_t n, size_t size)
++{
++	return kcalloc(n, size, GFP_KERNEL);
++}
++
++void ext2_nvm_free(void *p)
++{
++	kfree(p);
++}
++
++void ext2_nvm_quit(struct super_block *sb)
++{
++	int i;
++	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
++	struct ext2_sb_info *sbi = EXT2_SB(sb);
++	struct ext2_nvm_inode *p, *tp;
++
++	list_for_each_entry_safe(p, tp, &ext2_nvm_inode_lru_clean, lru) {
++		list_del(&p->lru);
++		ext2_nvm_free(p);
++	}
++
++	if (nvmi->inode_htab)
++		ext2_nvm_free(nvmi->inode_htab);
++	if (nvmi->group_desc) {
++		for (i = 0; i < sbi->s_groups_count; ++i)
++			if (nvmi->group_desc[i])
++				ext2_nvm_free(nvmi->group_desc[i]);
++		ext2_nvm_free(nvmi->group_desc);
++	}
++	if (nvmi->es)
++		ext2_nvm_free(nvmi->es);
++
++	if (nvmi->virt_addr) {
++		ext2_nvm_iounmap(nvmi->virt_addr, nvmi->initsize);
++		release_mem_region(nvmi->phys_addr, nvmi->initsize);
++	}
++
++	kfree(nvmi);
++}
++
++void ext2_nvm_sync_sb(struct super_block *sb)
++{
++	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
++	struct ext2_sb_info *sbi = EXT2_SB(sb);
++	unsigned long sb_block = sbi->s_sb_block;
++	unsigned long blocksize = BLOCK_SIZE << le32_to_cpu(sbi->s_es->s_log_block_size);
++	unsigned long offset = (sb_block * BLOCK_SIZE) % blocksize;
++	struct buffer_head *bh = sbi->s_sbh;
++	struct ext2_super_block *es;
++
++	/* Locate raw ext2_super_block from buffer */
++	es = (struct ext2_super_block *) (((char *) bh->b_data) + offset);
++	ext2_super_block_clone(es, nvmi->es);
++	mark_buffer_dirty(bh);
++	/*sync_dirty_buffer(bh);*/
++}
++
++void ext2_nvm_sync_gd(struct super_block *sb)
++{
++	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
++	struct ext2_sb_info *sbi = EXT2_SB(sb);
++	struct ext2_group_desc *gdp;
++	struct buffer_head *bh;
++	int i;
++
++	for (i = 0; i < sbi->s_groups_count; ++i) {
++		gdp = __ext2_get_group_desc(sb, i, &bh);
++		if (nvmi->group_desc[i]) {
++			ext2_group_desc_clone(gdp, nvmi->group_desc[i]);
++			mark_buffer_dirty(bh);
++			/*sync_dirty_buffer(bh);*/
++		}
++	}
++}
++
++void ext2_nvm_sync_inode_bm(struct super_block *sb)
++{
++
++}
++
++void ext2_nvm_sync_block_bm(struct super_block *sb)
++{
++
++}
++
++void ext2_nvm_sync_inode(struct super_block *sb)
++{
++	struct buffer_head *bh;
++	struct ext2_inode *raw_inode;
++	struct ext2_nvm_inode *p, *tp;
++
++	list_for_each_entry_safe(p, tp, &ext2_nvm_inode_lru_dirty, lru) {
++		raw_inode = __ext2_get_inode(sb, p->ino, &bh);
++		ext2_inode_clone(raw_inode, &p->raw_inode);
++		mark_buffer_dirty(bh);
++		/*
++		 * Functions like sync_blkdev will flush all dirty buffers
++		 * into disk, so we avoid syncing each time here.
++		 */
++		/*sync_dirty_buffer(bh);*/
++		brelse(bh);
++		/*
++		 * This function will remove p from the dirty lru and insert
++		 * into clean lru. Besides, we must use
++		 * list_for_each_entry_safe to iter the list since the
++		 * following operations will change the list.
++		 */
++		ext2_nvm_inode_mark_clean(p);
++	}
++}
++
++/*
++ * Copy data from NVM to corresponding buffer and mark_buffer_dirty(bh).
++ * IMPORTANT: we should use mark_nvm_dirty instead of mark_buffer_dirty
++ * in normal routine.
++ */
++void ext2_nvm_sync(struct super_block *sb)
++{
++	ext2_nvm_sync_sb(sb);
++	ext2_nvm_sync_gd(sb);
++	ext2_nvm_sync_inode(sb);
++	/* TODOs */
++	ext2_nvm_sync_inode_bm(sb);
++	ext2_nvm_sync_block_bm(sb);
++}
++
++/* hasnvm => sbi->es = sb->s_fs_nvmi->es */
++void ext2_nvm_write_super(struct super_block *sb)
++{
++	struct ext2_super_block *es = EXT2_SB(sb)->s_es;
++
++	lock_kernel();
++	es->s_free_blocks_count =
++		cpu_to_le32(ext2_count_free_blocks(sb));
++	es->s_free_inodes_count =
++		cpu_to_le32(ext2_count_free_inodes(sb));
++	/* Last write time */
++	es->s_wtime = cpu_to_le32(get_seconds());
++	sb->s_dirt = 0;
++	unlock_kernel();
++}
++
++struct ext2_group_desc *ext2_nvm_get_group_desc(struct super_block *sb,
++						unsigned int block_group,
++						struct buffer_head **bh)
++{
++	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
++	struct ext2_sb_info *sbi = EXT2_SB(sb);
++
++	if (block_group >= sbi->s_groups_count) {
++		ext2_error (sb, "ext2_get_group_desc",
++			    "block_group >= groups_count - "
++			    "block_group = %d, groups_count = %lu",
++			    block_group, sbi->s_groups_count);
++
++		return NULL;
++	}
++
++	return nvmi->group_desc[block_group];
++}
++
++/* Hash list operations */
++static struct ext2_nvm_inode *
++ext2_nvm_inode_lookup(struct super_block *sb, ino_t ino)
++{
++	unsigned long block_group = (ino-1) / EXT2_INODES_PER_GROUP(sb);
++	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
++	struct hlist_head *hlist_head = &nvmi->inode_htab[block_group];
++	struct ext2_nvm_inode *tp, *p = NULL;
++	struct hlist_node *nodep;
++
++	spin_lock(&ext2_nvm_inode_lock);
++	hlist_for_each_entry(tp, nodep, hlist_head, hash) {
++		if (tp->ino == ino) {
++			p = tp;
++			break;
++		}
++	}
++	spin_unlock(&ext2_nvm_inode_lock);
++
++	return p;
++}
++
++static void
++ext2_nvm_inode_install(struct super_block *sb, struct ext2_nvm_inode *inodep)
++{
++	unsigned long block_group = (inodep->ino-1) / EXT2_INODES_PER_GROUP(sb);
++	struct ext2_nvm_info *nvmi = sb->s_fs_nvmi;
++	struct hlist_head *hlist_head = &nvmi->inode_htab[block_group];
++
++	spin_lock(&ext2_nvm_inode_lock);
++	hlist_add_head(&inodep->hash, hlist_head);
++	spin_unlock(&ext2_nvm_inode_lock);
++}
++
++static void
++ext2_nvm_inode_del(struct super_block *sb, struct ext2_nvm_inode *inodep)
++{
++	spin_lock(&ext2_nvm_inode_lock);
++	hlist_del_init(&inodep->hash);
++	spin_unlock(&ext2_nvm_inode_lock);
++}
++
++/* LRU list operations */
++static void ext2_nvm_inode_mark_dirty(struct ext2_nvm_inode *nvm_inode)
++{
++
++	spin_lock(&ext2_nvm_inode_lock);
++	list_del(&nvm_inode->lru);
++	list_add(&nvm_inode->lru, &ext2_nvm_inode_lru_dirty);
++	spin_unlock(&ext2_nvm_inode_lock);
++}
++
++static void ext2_nvm_inode_mark_clean(struct ext2_nvm_inode *nvm_inode)
++{
++	spin_lock(&ext2_nvm_inode_lock);
++	list_del(&nvm_inode->lru);
++	list_add_tail(&nvm_inode->lru, &ext2_nvm_inode_lru_clean);
++	spin_unlock(&ext2_nvm_inode_lock);
++}
++
++static void ext2_nvm_inode_insert_clean(struct super_block *sb,
++		struct ext2_nvm_inode *nvm_inode)
++{
++
++
++	spin_lock(&ext2_nvm_inode_lock);
++	list_add(&nvm_inode->lru, &ext2_nvm_inode_lru_clean);
++	spin_unlock(&ext2_nvm_inode_lock);
++
++	/* Insert into the hash table of nvm inodes */
++	ext2_nvm_inode_install(sb, nvm_inode);
++}
++
++/* inode-related APIs */
++struct ext2_inode *ext2_nvm_get_inode(struct super_block *sb, ino_t ino,
++					struct buffer_head **p)
++{
++	/* Search inode via ino or load it */
++	struct ext2_nvm_inode *nvm_inodep = ext2_nvm_inode_lookup(sb, ino);
++	struct ext2_inode *retp = NULL;
++	/* The raw inode doesn't stay in NVM, then we cache it */
++	if (!nvm_inodep) {
++		lock_kernel();
++		/* The inode maybe loaded in other routine */
++		nvm_inodep = ext2_nvm_inode_lookup(sb, ino);
++		if (nvm_inodep) {
++			unlock_kernel();
++			goto got;
++		}
++		nvm_inodep = ext2_nvm_zalloc(sizeof(struct ext2_nvm_inode));
++		if (!nvm_inodep) {
++			printk("EXT2-fs: not enough memory on NVM\n");
++			goto failure;
++		}
++		nvm_inodep->ino = ino;
++		/*
++		 * bh->b_count = 2 since that per_cpu_lru will also bh_get(bh).
++		 * And here will cause sleep that we shouldn't use spinlock.
++		 */
++		retp = __ext2_get_inode(sb, ino, p);
++		if (IS_ERR(retp)) {
++			ext2_nvm_free(nvm_inodep);
++			goto failure;
++		}
++		ext2_inode_clone(&nvm_inodep->raw_inode, retp);
++		brelse(*p);
++
++		/* Insert into clean lru */
++		ext2_nvm_inode_insert_clean(sb, nvm_inodep);
++		unlock_kernel();
++	}
++got:
++	retp = &nvm_inodep->raw_inode;
++failure:
++	return retp;
++}
++
++int ext2_nvm_write_inode(struct inode *inode, int do_sync)
++{
++	struct ext2_inode_info *ei = EXT2_I(inode);
++	struct super_block *sb = inode->i_sb;
++	ino_t ino = inode->i_ino;
++	uid_t uid = inode->i_uid;
++	gid_t gid = inode->i_gid;
++	struct buffer_head *bh;
++	struct ext2_inode * raw_inode = ext2_nvm_get_inode(sb, ino, &bh);
++	struct ext2_nvm_inode *nvm_inode = EXT2_NVM_I(raw_inode);
++	int n;
++	int err = 0;
++
++	if (IS_ERR(raw_inode))
++ 		return -EIO;
++
++	/* For fields not not tracking in the in-memory inode,
++	 * initialise them to zero for new inodes. */
++	if (ei->i_state & EXT2_STATE_NEW)
++		memset(raw_inode, 0, EXT2_SB(sb)->s_inode_size);
++
++	ext2_get_inode_flags(ei);
++	raw_inode->i_mode = cpu_to_le16(inode->i_mode);
++	if (!(test_opt(sb, NO_UID32))) {
++		raw_inode->i_uid_low = cpu_to_le16(low_16_bits(uid));
++		raw_inode->i_gid_low = cpu_to_le16(low_16_bits(gid));
++/*
++ * Fix up interoperability with old kernels. Otherwise, old inodes get
++ * re-used with the upper 16 bits of the uid/gid intact
++ */
++		if (!ei->i_dtime) {
++			raw_inode->i_uid_high = cpu_to_le16(high_16_bits(uid));
++			raw_inode->i_gid_high = cpu_to_le16(high_16_bits(gid));
++		} else {
++			raw_inode->i_uid_high = 0;
++			raw_inode->i_gid_high = 0;
++		}
++	} else {
++		raw_inode->i_uid_low = cpu_to_le16(fs_high2lowuid(uid));
++		raw_inode->i_gid_low = cpu_to_le16(fs_high2lowgid(gid));
++		raw_inode->i_uid_high = 0;
++		raw_inode->i_gid_high = 0;
++	}
++	raw_inode->i_links_count = cpu_to_le16(inode->i_nlink);
++	raw_inode->i_size = cpu_to_le32(inode->i_size);
++	raw_inode->i_atime = cpu_to_le32(inode->i_atime.tv_sec);
++	raw_inode->i_ctime = cpu_to_le32(inode->i_ctime.tv_sec);
++	raw_inode->i_mtime = cpu_to_le32(inode->i_mtime.tv_sec);
++
++	raw_inode->i_blocks = cpu_to_le32(inode->i_blocks);
++	raw_inode->i_dtime = cpu_to_le32(ei->i_dtime);
++	raw_inode->i_flags = cpu_to_le32(ei->i_flags);
++	raw_inode->i_faddr = cpu_to_le32(ei->i_faddr);
++	raw_inode->i_frag = ei->i_frag_no;
++	raw_inode->i_fsize = ei->i_frag_size;
++	raw_inode->i_file_acl = cpu_to_le32(ei->i_file_acl);
++	if (!S_ISREG(inode->i_mode))
++		raw_inode->i_dir_acl = cpu_to_le32(ei->i_dir_acl);
++	else {
++		raw_inode->i_size_high = cpu_to_le32(inode->i_size >> 32);
++		if (inode->i_size > 0x7fffffffULL) {
++			if (!EXT2_HAS_RO_COMPAT_FEATURE(sb,
++					EXT2_FEATURE_RO_COMPAT_LARGE_FILE) ||
++			    EXT2_SB(sb)->s_es->s_rev_level ==
++					cpu_to_le32(EXT2_GOOD_OLD_REV)) {
++			       /* If this is the first large file
++				* created, add a flag to the superblock.
++				*/
++				lock_kernel();
++				ext2_update_dynamic_rev(sb);
++				EXT2_SET_RO_COMPAT_FEATURE(sb,
++					EXT2_FEATURE_RO_COMPAT_LARGE_FILE);
++				unlock_kernel();
++				ext2_write_super(sb);
++			}
++		}
++	}
++
++	raw_inode->i_generation = cpu_to_le32(inode->i_generation);
++	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode)) {
++		if (old_valid_dev(inode->i_rdev)) {
++			raw_inode->i_block[0] =
++				cpu_to_le32(old_encode_dev(inode->i_rdev));
++			raw_inode->i_block[1] = 0;
++		} else {
++			raw_inode->i_block[0] = 0;
++			raw_inode->i_block[1] =
++				cpu_to_le32(new_encode_dev(inode->i_rdev));
++			raw_inode->i_block[2] = 0;
++		}
++	} else for (n = 0; n < EXT2_N_BLOCKS; n++)
++		raw_inode->i_block[n] = ei->i_data[n];
++
++	ext2_nvm_inode_mark_dirty(nvm_inode);
++	ei->i_state &= ~EXT2_STATE_NEW;
++
++	return err;
++}
++
+diff --git a/fs/ext2/ext2_nvm.h b/fs/ext2/ext2_nvm.h
+new file mode 100644
+index 00000000..bbf9169a
+--- /dev/null
++++ b/fs/ext2/ext2_nvm.h
+@@ -0,0 +1,32 @@
++
++/* NVM initialization & destroy */
++extern void *ext2_nvm_ioremap(phys_addr_t phys_addr, ssize_t size);
++extern int ext2_nvm_iounmap(void *virt_addr, ssize_t size);
++extern phys_addr_t ext2_nvm_get_phys_addr(void **data);
++extern int ext2_nvm_init(struct ext2_nvm_info *nvmi);
++extern void ext2_nvm_quit(struct super_block *sb);
++
++/* Dynamic memory management in NVM */
++extern void *ext2_nvm_malloc(size_t size);
++extern void *ext2_nvm_zalloc(size_t size);
++/* Allocate memory for an array and the memory is set to zero */
++extern void *ext2_nvm_calloc(size_t n, size_t size);
++extern void ext2_nvm_free(void *bp);
++
++/* Sync data between NVM and backing devices */
++extern void ext2_nvm_sync(struct super_block *sb);
++extern void ext2_nvm_sync_sb(struct super_block *sb);
++extern void ext2_nvm_sync_gd(struct super_block *sb);
++extern void ext2_nvm_sync_inode_bm(struct super_block *sb);
++extern void ext2_nvm_sync_block_bm(struct super_block *sb);
++extern void ext2_nvm_sync_inode(struct super_block *sb);
++
++/* API wrapper with NVM embedded */
++extern struct ext2_inode *ext2_nvm_get_inode(struct super_block *sb, ino_t ino,
++						struct buffer_head **p);
++extern struct ext2_group_desc *ext2_nvm_get_group_desc(struct super_block *sb,
++							unsigned int block_group,
++							struct buffer_head **bh);
++extern void ext2_nvm_write_super(struct super_block *sb);
++extern int ext2_nvm_write_inode(struct inode *inode, int do_sync);
++
+diff --git a/fs/ext2/ialloc.c b/fs/ext2/ialloc.c
+index 15387c9c..d52f6b65 100644
+--- a/fs/ext2/ialloc.c
++++ b/fs/ext2/ialloc.c
+@@ -6,7 +6,7 @@
+  * Laboratoire MASI - Institut Blaise Pascal
+  * Universite Pierre et Marie Curie (Paris VI)
+  *
+- *  BSD ufs-inspired inode and directory allocation by 
++ *  BSD ufs-inspired inode and directory allocation by
+  *  Stephen Tweedie (sct@dcs.ed.ac.uk), 1993
+  *  Big-endian to little-endian byte-swapping/bitmaps by
+  *        David S. Miller (davem@caip.rutgers.edu), 1995
+@@ -82,7 +82,8 @@ static void ext2_release_inode(struct super_block *sb, int group, int dir)
+ 	if (dir)
+ 		percpu_counter_dec(&EXT2_SB(sb)->s_dirs_counter);
+ 	sb->s_dirt = 1;
+-	mark_buffer_dirty(bh);
++	if (!test_opt(sb, NVM))
++		mark_buffer_dirty(bh);
+ }
+ 
+ /*
+@@ -222,7 +223,7 @@ static int find_group_dir(struct super_block *sb, struct inode *parent)
+ 			continue;
+ 		if (le16_to_cpu(desc->bg_free_inodes_count) < avefreei)
+ 			continue;
+-		if (!best_desc || 
++		if (!best_desc ||
+ 		    (le16_to_cpu(desc->bg_free_blocks_count) >
+ 		     le16_to_cpu(best_desc->bg_free_blocks_count))) {
+ 			best_group = group;
+@@ -235,30 +236,30 @@ static int find_group_dir(struct super_block *sb, struct inode *parent)
+ 	return best_group;
+ }
+ 
+-/* 
+- * Orlov's allocator for directories. 
+- * 
++/*
++ * Orlov's allocator for directories.
++ *
+  * We always try to spread first-level directories.
+  *
+- * If there are blockgroups with both free inodes and free blocks counts 
+- * not worse than average we return one with smallest directory count. 
+- * Otherwise we simply return a random group. 
+- * 
+- * For the rest rules look so: 
+- * 
+- * It's OK to put directory into a group unless 
+- * it has too many directories already (max_dirs) or 
+- * it has too few free inodes left (min_inodes) or 
+- * it has too few free blocks left (min_blocks) or 
+- * it's already running too large debt (max_debt). 
+- * Parent's group is preferred, if it doesn't satisfy these 
+- * conditions we search cyclically through the rest. If none 
+- * of the groups look good we just look for a group with more 
+- * free inodes than average (starting at parent's group). 
+- * 
+- * Debt is incremented each time we allocate a directory and decremented 
+- * when we allocate an inode, within 0--255. 
+- */ 
++ * If there are blockgroups with both free inodes and free blocks counts
++ * not worse than average we return one with smallest directory count.
++ * Otherwise we simply return a random group.
++ *
++ * For the rest rules look so:
++ *
++ * It's OK to put directory into a group unless
++ * it has too many directories already (max_dirs) or
++ * it has too few free inodes left (min_inodes) or
++ * it has too few free blocks left (min_blocks) or
++ * it's already running too large debt (max_debt).
++ * Parent's group is preferred, if it doesn't satisfy these
++ * conditions we search cyclically through the rest. If none
++ * of the groups look good we just look for a group with more
++ * free inodes than average (starting at parent's group).
++ *
++ * Debt is incremented each time we allocate a directory and decremented
++ * when we allocate an inode, within 0--255.
++ */
+ 
+ #define INODE_COST 64
+ #define BLOCK_COST 256
+@@ -462,7 +463,7 @@ struct inode *ext2_new_inode(struct inode *dir, int mode)
+ 			group = find_group_dir(sb, dir);
+ 		else
+ 			group = find_group_orlov(sb, dir);
+-	} else 
++	} else
+ 		group = find_group_other(sb, dir);
+ 
+ 	if (group == -1) {
+@@ -549,7 +550,8 @@ got:
+ 	spin_unlock(sb_bgl_lock(sbi, group));
+ 
+ 	sb->s_dirt = 1;
+-	mark_buffer_dirty(bh2);
++	if (!test_opt(sb, NVM))
++		mark_buffer_dirty(bh2);
+ 	inode->i_uid = current_fsuid();
+ 	if (test_opt (sb, GRPID))
+ 		inode->i_gid = dir->i_gid;
+@@ -625,7 +627,7 @@ unsigned long ext2_count_free_inodes (struct super_block * sb)
+ {
+ 	struct ext2_group_desc *desc;
+ 	unsigned long desc_count = 0;
+-	int i;	
++	int i;
+ 
+ #ifdef EXT2FS_DEBUG
+ 	struct ext2_super_block *es;
+diff --git a/fs/ext2/inode.c b/fs/ext2/inode.c
+index ade63407..144bb6e6 100644
+--- a/fs/ext2/inode.c
++++ b/fs/ext2/inode.c
+@@ -36,6 +36,7 @@
+ #include "ext2.h"
+ #include "acl.h"
+ #include "xip.h"
++#include "ext2_nvm.h"
+ 
+ MODULE_AUTHOR("Remy Card and others");
+ MODULE_DESCRIPTION("Second Extended Filesystem");
+@@ -1003,7 +1004,7 @@ static void ext2_free_branches(struct inode *inode, __le32 *p, __le32 *q, int de
+ 			/*
+ 			 * A read failure? Report error and clear slot
+ 			 * (should be rare).
+-			 */ 
++			 */
+ 			if (!bh) {
+ 				ext2_error(inode->i_sb, "ext2_free_branches",
+ 					"Read failure, inode=%ld, block=%ld",
+@@ -1131,7 +1132,7 @@ do_indirects:
+ 	}
+ }
+ 
+-static struct ext2_inode *ext2_get_inode(struct super_block *sb, ino_t ino,
++struct ext2_inode *__ext2_get_inode(struct super_block *sb, ino_t ino,
+ 					struct buffer_head **p)
+ {
+ 	struct buffer_head * bh;
+@@ -1174,6 +1175,16 @@ Egdp:
+ 	return ERR_PTR(-EIO);
+ }
+ 
++static struct ext2_inode *ext2_get_inode(struct super_block *sb, ino_t ino,
++					struct buffer_head **p)
++{
++	if (test_opt(sb, NVM))
++		return ext2_nvm_get_inode(sb, ino, p);
++	else
++		return __ext2_get_inode(sb, ino, p);
++	/*return __ext2_get_inode(sb, ino, p);*/
++}
++
+ void ext2_set_inode_flags(struct inode *inode)
+ {
+ 	unsigned int flags = EXT2_I(inode)->i_flags;
+@@ -1319,21 +1330,22 @@ struct inode *ext2_iget (struct super_block *sb, unsigned long ino)
+ 		if (raw_inode->i_block[0])
+ 			init_special_inode(inode, inode->i_mode,
+ 			   old_decode_dev(le32_to_cpu(raw_inode->i_block[0])));
+-		else 
++		else
+ 			init_special_inode(inode, inode->i_mode,
+ 			   new_decode_dev(le32_to_cpu(raw_inode->i_block[1])));
+ 	}
+-	brelse (bh);
++	if (!test_opt(sb, NVM))
++		brelse(bh);
+ 	ext2_set_inode_flags(inode);
+ 	unlock_new_inode(inode);
+ 	return inode;
+-	
++
+ bad_inode:
+ 	iget_failed(inode);
+ 	return ERR_PTR(ret);
+ }
+ 
+-int ext2_write_inode(struct inode *inode, int do_sync)
++int __ext2_write_inode(struct inode *inode, int do_sync)
+ {
+ 	struct ext2_inode_info *ei = EXT2_I(inode);
+ 	struct super_block *sb = inode->i_sb;
+@@ -1409,7 +1421,7 @@ int ext2_write_inode(struct inode *inode, int do_sync)
+ 			}
+ 		}
+ 	}
+-	
++
+ 	raw_inode->i_generation = cpu_to_le32(inode->i_generation);
+ 	if (S_ISCHR(inode->i_mode) || S_ISBLK(inode->i_mode)) {
+ 		if (old_valid_dev(inode->i_rdev)) {
+@@ -1438,6 +1450,15 @@ int ext2_write_inode(struct inode *inode, int do_sync)
+ 	return err;
+ }
+ 
++int ext2_write_inode(struct inode *inode, int do_sync)
++{
++	if (test_opt(inode->i_sb, NVM))
++		return ext2_nvm_write_inode(inode, do_sync);
++	else
++		return __ext2_write_inode(inode, do_sync);
++	/*return __ext2_write_inode(inode, do_sync);*/
++}
++
+ int ext2_sync_inode(struct inode *inode)
+ {
+ 	struct writeback_control wbc = {
+diff --git a/fs/ext2/namei.c b/fs/ext2/namei.c
+index dd7175ce..3a45bf2f 100644
+--- a/fs/ext2/namei.c
++++ b/fs/ext2/namei.c
+@@ -58,7 +58,7 @@ static struct dentry *ext2_lookup(struct inode * dir, struct dentry *dentry, str
+ {
+ 	struct inode * inode;
+ 	ino_t ino;
+-	
++
+ 	if (dentry->d_name.len > EXT2_NAME_LEN)
+ 		return ERR_PTR(-ENAMETOOLONG);
+ 
+@@ -87,7 +87,7 @@ struct dentry *ext2_get_parent(struct dentry *child)
+ 	if (!ino)
+ 		return ERR_PTR(-ENOENT);
+ 	return d_obtain_alias(ext2_iget(child->d_inode->i_sb, ino));
+-} 
++}
+ 
+ /*
+  * By the time this is called, we already have created
+@@ -95,7 +95,7 @@ struct dentry *ext2_get_parent(struct dentry *child)
+  * is so far negative - it has no inode.
+  *
+  * If the create succeeds, we fill in the inode information
+- * with d_instantiate(). 
++ * with d_instantiate().
+  */
+ static int ext2_create (struct inode * dir, struct dentry * dentry, int mode, struct nameidata *nd)
+ {
+diff --git a/fs/ext2/super.c b/fs/ext2/super.c
+index 1a9ffee4..854912c5 100644
+--- a/fs/ext2/super.c
++++ b/fs/ext2/super.c
+@@ -16,6 +16,8 @@
+  *        David S. Miller (davem@caip.rutgers.edu), 1995
+  */
+ 
++#include <linux/kernel.h>
++#include <linux/ctype.h>
+ #include <linux/module.h>
+ #include <linux/string.h>
+ #include <linux/fs.h>
+@@ -32,11 +34,13 @@
+ #include <linux/mount.h>
+ #include <linux/log2.h>
+ #include <linux/quotaops.h>
++#include <linux/io.h>
+ #include <asm/uaccess.h>
+ #include "ext2.h"
+ #include "xattr.h"
+ #include "acl.h"
+ #include "xip.h"
++#include "ext2_nvm.h"
+ 
+ static void ext2_sync_super(struct super_block *sb,
+ 			    struct ext2_super_block *es);
+@@ -109,7 +113,7 @@ void ext2_update_dynamic_rev(struct super_block *sb)
+ 	 */
+ }
+ 
+-static void ext2_put_super (struct super_block * sb)
++static void ext2_put_super (struct super_block *sb)
+ {
+ 	int db_count;
+ 	int i;
+@@ -127,16 +131,27 @@ static void ext2_put_super (struct super_block * sb)
+ 		es->s_state = cpu_to_le16(sbi->s_mount_state);
+ 		ext2_sync_super(sb, es);
+ 	}
++
++	if (test_opt(sb, NVM))
++		ext2_nvm_sync(sb);
++
++	/* Release buffer of group descriptions */
+ 	db_count = sbi->s_gdb_count;
+ 	for (i = 0; i < db_count; i++)
+ 		if (sbi->s_group_desc[i])
+ 			brelse (sbi->s_group_desc[i]);
++
+ 	kfree(sbi->s_group_desc);
+ 	kfree(sbi->s_debts);
+ 	percpu_counter_destroy(&sbi->s_freeblocks_counter);
+ 	percpu_counter_destroy(&sbi->s_freeinodes_counter);
+ 	percpu_counter_destroy(&sbi->s_dirs_counter);
++	/* Release buffer of super block */
+ 	brelse (sbi->s_sbh);
++
++	if (test_opt(sb, NVM))
++		ext2_nvm_quit(sb);
++
+ 	sb->s_fs_info = NULL;
+ 	kfree(sbi->s_blockgroup_lock);
+ 	kfree(sbi);
+@@ -279,6 +294,11 @@ static int ext2_show_options(struct seq_file *seq, struct vfsmount *vfs)
+ 	if (!test_opt(sb, RESERVATION))
+ 		seq_puts(seq, ",noreservation");
+ 
++	if (test_opt(sb, NVM))
++		seq_puts(seq, ",nvm");
++	if (!test_opt(sb, NVM))
++		seq_puts(seq, ",nonvm");
++
+ 	return 0;
+ }
+ 
+@@ -382,7 +402,8 @@ enum {
+ 	Opt_err_ro, Opt_nouid32, Opt_nocheck, Opt_debug,
+ 	Opt_oldalloc, Opt_orlov, Opt_nobh, Opt_user_xattr, Opt_nouser_xattr,
+ 	Opt_acl, Opt_noacl, Opt_xip, Opt_ignore, Opt_err, Opt_quota,
+-	Opt_usrquota, Opt_grpquota, Opt_reservation, Opt_noreservation
++	Opt_usrquota, Opt_grpquota, Opt_reservation, Opt_noreservation,
++	Opt_addr, Opt_size
+ };
+ 
+ static const match_table_t tokens = {
+@@ -416,13 +437,54 @@ static const match_table_t tokens = {
+ 	{Opt_usrquota, "usrquota"},
+ 	{Opt_reservation, "reservation"},
+ 	{Opt_noreservation, "noreservation"},
++	{Opt_addr, "physaddr=%x"},
++	{Opt_size, "init=%s"},
+ 	{Opt_err, NULL}
+ };
+ 
++/* Has NVM? */
++static int parse_options_early(char *options, struct ext2_nvm_info *nvmi)
++{
++	char *p, *rest;
++	substring_t args[MAX_OPT_ARGS];
++	int ret = 0;
++
++	if (!options)
++		return 0;
++
++	while ((p = strsep (&options, ",")) != NULL) {
++		int token;
++		if (!*p)
++			continue;
++		token = match_token(p, tokens, args);
++		switch (token) {
++		case Opt_addr:
++			/* physaddr managed in ext2_nvm_get_phys_addr() */
++			++ret;
++			break;
++		case Opt_size:
++			/* memparse() will accept a K/M/G without a digit */
++			if (!isdigit(*args[0].from))
++				goto bad_val;
++			/* llu => ul happens here */
++			nvmi->initsize = memparse(args[0].from, &rest);
++			++ret;
++			break;
++		default:
++			return 0;
++		}
++	}
++	return ret;
++bad_val:
++	printk(KERN_INFO "Bad value '%s' for mount option '%s'\n", args[0].from,
++	       p);
++	return 0;
++}
++
+ static int parse_options (char * options,
+ 			  struct ext2_sb_info *sbi)
+ {
+-	char * p;
++	char *p;
+ 	substring_t args[MAX_OPT_ARGS];
+ 	int option;
+ 
+@@ -436,6 +498,14 @@ static int parse_options (char * options,
+ 
+ 		token = match_token(p, tokens, args);
+ 		switch (token) {
++		case Opt_addr:
++			/* physaddr managed in ext2_nvm_get_phys_addr() */
++			break;
++		case Opt_size:
++			/*
++			 * nvm related options have been handled in
++			 * parse_options_early */
++			break;
+ 		case Opt_bsd_df:
+ 			clear_opt (sbi->s_mount_opt, MINIX_DF);
+ 			break;
+@@ -547,7 +617,6 @@ static int parse_options (char * options,
+ 
+ 			break;
+ #endif
+-
+ 		case Opt_reservation:
+ 			set_opt(sbi->s_mount_opt, RESERVATION);
+ 			printk("reservations ON\n");
+@@ -714,7 +783,7 @@ static unsigned long descriptor_loc(struct super_block *sb,
+ 	struct ext2_sb_info *sbi = EXT2_SB(sb);
+ 	unsigned long bg, first_meta_bg;
+ 	int has_super = 0;
+-	
++
+ 	first_meta_bg = le32_to_cpu(sbi->s_es->s_first_meta_bg);
+ 
+ 	if (!EXT2_HAS_INCOMPAT_FEATURE(sb, EXT2_FEATURE_INCOMPAT_META_BG) ||
+@@ -731,6 +800,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ {
+ 	struct buffer_head * bh;
+ 	struct ext2_sb_info * sbi;
++	struct ext2_nvm_info *nvmi;
+ 	struct ext2_super_block * es;
+ 	struct inode *root;
+ 	unsigned long block;
+@@ -744,20 +814,52 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ 	int i, j;
+ 	__le32 features;
+ 	int err;
++	struct ext2_group_desc *gdp;
+ 
+ 	sbi = kzalloc(sizeof(*sbi), GFP_KERNEL);
+ 	if (!sbi)
+ 		return -ENOMEM;
+-
+ 	sbi->s_blockgroup_lock =
+ 		kzalloc(sizeof(struct blockgroup_lock), GFP_KERNEL);
+ 	if (!sbi->s_blockgroup_lock) {
+ 		kfree(sbi);
+ 		return -ENOMEM;
+ 	}
++
+ 	sb->s_fs_info = sbi;
+ 	sbi->s_sb_block = sb_block;
+ 
++	/* parse_options_early > 0 => hasnvm => alloc sbi on nvm zone */
++	nvmi = kzalloc(sizeof(*nvmi), GFP_KERNEL);
++	if (!nvmi)
++		return -ENOMEM;
++	if (!parse_options_early((char *) data, nvmi))
++		goto nil_nvm;
++
++	nvmi->phys_addr = ext2_nvm_get_phys_addr(&data);
++	if (nvmi->phys_addr == (phys_addr_t) ULLONG_MAX) {
++		printk ("EXT2-fs: unable to get nvm physical address\n");
++		goto nil_nvm;
++	}
++	err = ext2_nvm_init(nvmi);
++	if (!err) {
++		/* NVM is ready, active it and we we'll use it as cache */
++		nvmi->isalive = 1;
++		/* ext2 compatible flag: EXT2_MOUNT_NVM <=> nvmi->isalive */
++		set_opt(sbi->s_mount_opt, NVM);
++		sb->s_fs_nvmi = nvmi;
++		printk("EXT2-fs: nvm-aware mode is enabled\n");
++		goto has_nvm;
++	}
++nil_nvm:
++	/* err in ext2_nvm_init, then we should release the iomem region */
++	if (nvmi->virt_addr) {
++		ext2_nvm_iounmap(nvmi->virt_addr, nvmi->initsize);
++		release_mem_region(nvmi->phys_addr, nvmi->initsize);
++	}
++	printk("EXT2-fs: unable to set NVM\n");
++	kfree(nvmi);
++has_nvm:
+ 	/*
+ 	 * See what the current blocksize for the device is, and
+ 	 * use that as the blocksize.  Otherwise (or if the blocksize
+@@ -773,7 +875,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ 
+ 	/*
+ 	 * If the superblock doesn't start on a hardware sector boundary,
+-	 * calculate the offset.  
++	 * calculate the offset.
+ 	 */
+ 	if (blocksize != BLOCK_SIZE) {
+ 		logic_sb_block = (sb_block*BLOCK_SIZE) / blocksize;
+@@ -786,18 +888,26 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ 		printk ("EXT2-fs: unable to read superblock\n");
+ 		goto failed_sbi;
+ 	}
++
+ 	/*
+ 	 * Note: s_es must be initialized as soon as possible because
+ 	 *       some ext2 macro-instructions depend on its value
+ 	 */
+ 	es = (struct ext2_super_block *) (((char *)bh->b_data) + offset);
++
++	if (test_opt(sb, NVM)) {
++		nvmi->es = ext2_nvm_zalloc(sizeof(*es));
++		ext2_super_block_clone(nvmi->es, es);
++		es = nvmi->es;
++	}
++
+ 	sbi->s_es = es;
+ 	sb->s_magic = le16_to_cpu(es->s_magic);
+ 
+ 	if (sb->s_magic != EXT2_SUPER_MAGIC)
+ 		goto cantfind_ext2;
+ 
+-	/* Set defaults before we parse the mount options */
++	/* Set defaults after we parse the mount options */
+ 	def_mount_opts = le32_to_cpu(es->s_default_mount_opts);
+ 	if (def_mount_opts & EXT2_DEFM_DEBUG)
+ 		set_opt(sbi->s_mount_opt, DEBUG);
+@@ -813,7 +923,6 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ 	if (def_mount_opts & EXT2_DEFM_ACL)
+ 		set_opt(sbi->s_mount_opt, POSIX_ACL);
+ #endif
+-	
+ 	if (le16_to_cpu(sbi->s_es->s_errors) == EXT2_ERRORS_PANIC)
+ 		set_opt(sbi->s_mount_opt, ERRORS_PANIC);
+ 	else if (le16_to_cpu(sbi->s_es->s_errors) == EXT2_ERRORS_CONTINUE)
+@@ -823,7 +932,7 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ 
+ 	sbi->s_resuid = le16_to_cpu(es->s_def_resuid);
+ 	sbi->s_resgid = le16_to_cpu(es->s_def_resgid);
+-	
++
+ 	set_opt(sbi->s_mount_opt, RESERVATION);
+ 
+ 	if (!parse_options ((char *) data, sbi))
+@@ -882,12 +991,18 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ 		logic_sb_block = (sb_block*BLOCK_SIZE) / blocksize;
+ 		offset = (sb_block*BLOCK_SIZE) % blocksize;
+ 		bh = sb_bread(sb, logic_sb_block);
+-		if(!bh) {
++		if (!bh) {
+ 			printk("EXT2-fs: Couldn't read superblock on "
+ 			       "2nd try.\n");
+ 			goto failed_sbi;
+ 		}
+ 		es = (struct ext2_super_block *) (((char *)bh->b_data) + offset);
++		if (test_opt(sb, NVM)) {
++			if (!nvmi->es)
++				es = ext2_nvm_zalloc(sizeof(*es));
++			ext2_super_block_clone(nvmi->es, es);
++			es = nvmi->es;
++		}
+ 		sbi->s_es = es;
+ 		if (es->s_magic != cpu_to_le16(EXT2_SUPER_MAGIC)) {
+ 			printk ("EXT2-fs: Magic mismatch, very weird !\n");
+@@ -972,22 +1087,35 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ 
+ 	if (EXT2_BLOCKS_PER_GROUP(sb) == 0)
+ 		goto cantfind_ext2;
+- 	sbi->s_groups_count = ((le32_to_cpu(es->s_blocks_count) -
+- 				le32_to_cpu(es->s_first_data_block) - 1)
+- 					/ EXT2_BLOCKS_PER_GROUP(sb)) + 1;
++	sbi->s_groups_count = ((le32_to_cpu(es->s_blocks_count) -
++				le32_to_cpu(es->s_first_data_block) - 1)
++					/ EXT2_BLOCKS_PER_GROUP(sb)) + 1;
+ 	db_count = (sbi->s_groups_count + EXT2_DESC_PER_BLOCK(sb) - 1) /
+ 		   EXT2_DESC_PER_BLOCK(sb);
+-	sbi->s_group_desc = kmalloc (db_count * sizeof (struct buffer_head *), GFP_KERNEL);
++	sbi->s_group_desc =
++		kmalloc(db_count * sizeof(struct buffer_head *), GFP_KERNEL);
+ 	if (sbi->s_group_desc == NULL) {
+ 		printk ("EXT2-fs: not enough memory\n");
+ 		goto failed_mount;
+ 	}
++	if (test_opt(sb, NVM)) {
++		/* Alloc slots of group descriptors in ext2_nvm_info */
++		nvmi->group_desc =
++			ext2_nvm_zalloc(sbi->s_groups_count * sizeof(struct ext2_group_desc *));
++		if (nvmi->group_desc == NULL) {
++			printk ("EXT2-fs: not enough memory on NVM\n");
++			goto failed_mount;
++		}
++	}
++
+ 	bgl_lock_init(sbi->s_blockgroup_lock);
+-	sbi->s_debts = kcalloc(sbi->s_groups_count, sizeof(*sbi->s_debts), GFP_KERNEL);
++	sbi->s_debts =
++		kcalloc(sbi->s_groups_count, sizeof(*sbi->s_debts), GFP_KERNEL);
+ 	if (!sbi->s_debts) {
+ 		printk ("EXT2-fs: not enough memory\n");
+ 		goto failed_mount_group_desc;
+ 	}
++	/* Load group descs' blocks into buffer */
+ 	for (i = 0; i < db_count; i++) {
+ 		block = descriptor_loc(sb, logic_sb_block, i);
+ 		sbi->s_group_desc[i] = sb_bread(sb, block);
+@@ -998,11 +1126,36 @@ static int ext2_fill_super(struct super_block *sb, void *data, int silent)
+ 			goto failed_mount_group_desc;
+ 		}
+ 	}
++	/* Copy gds into NVM */
++	if (test_opt(sb, NVM)) {
++		for (i = 0; i < sbi->s_groups_count; ++i) {
++			nvmi->group_desc[i] = ext2_nvm_zalloc(sizeof(*gdp));
++			if (nvmi->group_desc[i] == NULL) {
++				printk("EXT2-fs: not enough memory on NVM\n");
++				goto failed_mount2;
++			}
++			gdp = __ext2_get_group_desc(sb, i, NULL);
++			ext2_group_desc_clone(nvmi->group_desc[i], gdp);
++		}
++	}
+ 	if (!ext2_check_descriptors (sb)) {
+ 		printk ("EXT2-fs: group descriptors corrupted!\n");
+ 		goto failed_mount2;
+ 	}
+ 	sbi->s_gdb_count = db_count;
++
++	/* Hash table for searching raw inodes in NVM */
++	if (test_opt(sb, NVM)) {
++		nvmi->inode_htab =
++			ext2_nvm_calloc(sbi->s_groups_count, sizeof(struct hlist_head));
++		if (!nvmi->inode_htab) {
++			printk("EXT2-fs: not enough memory in NVM\n");
++			goto failed_mount2;
++		}
++		for (i = 0; i < sbi->s_groups_count; ++i)
++			INIT_HLIST_HEAD(&nvmi->inode_htab[i]);
++	}
++
+ 	get_random_bytes(&sbi->s_next_generation, sizeof(u32));
+ 	spin_lock_init(&sbi->s_next_gen_lock);
+ 
+@@ -1083,6 +1236,8 @@ failed_mount_group_desc:
+ failed_mount:
+ 	brelse(bh);
+ failed_sbi:
++	if (test_opt(sb, NVM))
++		ext2_nvm_quit(sb);
+ 	sb->s_fs_info = NULL;
+ 	kfree(sbi->s_blockgroup_lock);
+ 	kfree(sbi);
+@@ -1099,11 +1254,16 @@ static void ext2_commit_super (struct super_block * sb,
+ 
+ static void ext2_sync_super(struct super_block *sb, struct ext2_super_block *es)
+ {
+-	es->s_free_blocks_count = cpu_to_le32(ext2_count_free_blocks(sb));
+-	es->s_free_inodes_count = cpu_to_le32(ext2_count_free_inodes(sb));
+-	es->s_wtime = cpu_to_le32(get_seconds());
+-	mark_buffer_dirty(EXT2_SB(sb)->s_sbh);
+-	sync_dirty_buffer(EXT2_SB(sb)->s_sbh);
++	if (test_opt(sb, NVM)) {
++		/* ex2_sync_super <=> ext2_nvm_write_super */
++		ext2_nvm_write_super(sb);
++	} else {
++		es->s_free_blocks_count = cpu_to_le32(ext2_count_free_blocks(sb));
++		es->s_free_inodes_count = cpu_to_le32(ext2_count_free_inodes(sb));
++		es->s_wtime = cpu_to_le32(get_seconds());
++		mark_buffer_dirty(EXT2_SB(sb)->s_sbh);
++		sync_dirty_buffer(EXT2_SB(sb)->s_sbh);
++	}
+ 	sb->s_dirt = 0;
+ }
+ 
+@@ -1123,17 +1283,30 @@ static int ext2_sync_fs(struct super_block *sb, int wait)
+ 	struct ext2_super_block *es = EXT2_SB(sb)->s_es;
+ 
+ 	lock_kernel();
+-	if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
+-		ext2_debug("setting valid to 0\n");
+-		es->s_state &= cpu_to_le16(~EXT2_VALID_FS);
+-		es->s_free_blocks_count =
+-			cpu_to_le32(ext2_count_free_blocks(sb));
+-		es->s_free_inodes_count =
+-			cpu_to_le32(ext2_count_free_inodes(sb));
+-		es->s_mtime = cpu_to_le32(get_seconds());
+-		ext2_sync_super(sb, es);
++	if (test_opt(sb, NVM)) {
++		if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
++			ext2_debug("setting valid to 0\n");
++			es->s_state &= cpu_to_le16(~EXT2_VALID_FS);
++			/* Last mount time */
++			es->s_mtime = cpu_to_le32(get_seconds());
++			ext2_nvm_write_super(sb);
++		} else
++			/* Just commit if invalid */
++			es->s_wtime = cpu_to_le32(get_seconds());
+ 	} else {
+-		ext2_commit_super(sb, es);
++		/* Old fashion */
++		if (es->s_state & cpu_to_le16(EXT2_VALID_FS)) {
++			ext2_debug("setting valid to 0\n");
++			es->s_state &= cpu_to_le16(~EXT2_VALID_FS);
++			es->s_free_blocks_count =
++				cpu_to_le32(ext2_count_free_blocks(sb));
++			es->s_free_inodes_count =
++				cpu_to_le32(ext2_count_free_inodes(sb));
++			es->s_mtime = cpu_to_le32(get_seconds());
++			ext2_sync_super(sb, es);
++		} else {
++			ext2_commit_super(sb, es);
++		}
+ 	}
+ 	sb->s_dirt = 0;
+ 	unlock_kernel();
+@@ -1141,7 +1314,7 @@ static int ext2_sync_fs(struct super_block *sb, int wait)
+ 	return 0;
+ }
+ 
+-
++/* ext2_write_super <=> ext2_sync_fs in ext2 */
+ void ext2_write_super(struct super_block *sb)
+ {
+ 	if (!(sb->s_flags & MS_RDONLY))
+diff --git a/include/linux/ext2_fs.h b/include/linux/ext2_fs.h
+index 121720d7..c757232c 100644
+--- a/include/linux/ext2_fs.h
++++ b/include/linux/ext2_fs.h
+@@ -18,6 +18,7 @@
+ 
+ #include <linux/types.h>
+ #include <linux/magic.h>
++#include <linux/string.h>
+ 
+ /*
+  * The second extended filesystem constants/structures
+@@ -142,6 +143,12 @@ struct ext2_group_desc
+ 	__le32	bg_reserved[3];
+ };
+ 
++static inline void
++ext2_group_desc_clone(struct ext2_group_desc *dst, struct ext2_group_desc *src)
++{
++	memcpy(dst, src, sizeof(*src));
++}
++
+ /*
+  * Macro-instructions used to manage group descriptors
+  */
+@@ -181,7 +188,7 @@ struct ext2_group_desc
+ #define EXT2_COMPRBLK_FL		FS_COMPRBLK_FL	/* One or more compressed clusters */
+ #define EXT2_NOCOMP_FL			FS_NOCOMP_FL	/* Don't compress */
+ #define EXT2_ECOMPR_FL			FS_ECOMPR_FL	/* Compression error */
+-/* End compression flags --- maybe not all used */	
++/* End compression flags --- maybe not all used */
+ #define EXT2_BTREE_FL			FS_BTREE_FL	/* btree format dir */
+ #define EXT2_INDEX_FL			FS_INDEX_FL	/* hash-indexed directory */
+ #define EXT2_IMAGIC_FL			FS_IMAGIC_FL	/* AFS directory */
+@@ -293,6 +300,12 @@ struct ext2_inode {
+ 	} osd2;				/* OS dependent 2 */
+ };
+ 
++static inline void
++ext2_inode_clone(struct ext2_inode *dst, struct ext2_inode *src)
++{
++	memcpy(dst, src, sizeof(*src));
++}
++
+ #define i_size_high	i_dir_acl
+ 
+ #if defined(__KERNEL__) || defined(__linux__)
+@@ -347,6 +360,7 @@ struct ext2_inode {
+ #define EXT2_MOUNT_USRQUOTA		0x020000  /* user quota */
+ #define EXT2_MOUNT_GRPQUOTA		0x040000  /* group quota */
+ #define EXT2_MOUNT_RESERVATION		0x080000  /* Preallocation */
++#define EXT2_MOUNT_NVM			0x100000  /* If has NVM */
+ 
+ 
+ #define clear_opt(o, opt)		o &= ~EXT2_MOUNT_##opt
+@@ -403,7 +417,7 @@ struct ext2_super_block {
+ 	 * the incompatible feature set is that if there is a bit set
+ 	 * in the incompatible feature set that the kernel doesn't
+ 	 * know about, it should refuse to mount the filesystem.
+-	 * 
++	 *
+ 	 * e2fsck's requirements are more strict; if it doesn't know
+ 	 * about a feature in either the compatible or incompatible
+ 	 * feature set, it must abort and not try to meddle with
+@@ -442,6 +456,12 @@ struct ext2_super_block {
+ 	__u32	s_reserved[190];	/* Padding to the end of the block */
+ };
+ 
++static inline void
++ext2_super_block_clone(struct ext2_super_block *dst, struct ext2_super_block *src)
++{
++	memcpy(dst, src, sizeof(*src));
++}
++
+ /*
+  * Codes for operating systems
+  */
+@@ -529,7 +549,7 @@ struct ext2_super_block {
+ #define EXT2_DEFM_ACL		0x0008
+ #define EXT2_DEFM_UID16		0x0010
+     /* Not used by ext2, but reserved for use by ext3 */
+-#define EXT3_DEFM_JMODE		0x0060 
++#define EXT3_DEFM_JMODE		0x0060
+ #define EXT3_DEFM_JMODE_DATA	0x0020
+ #define EXT3_DEFM_JMODE_ORDERED	0x0040
+ #define EXT3_DEFM_JMODE_WBACK	0x0060
+diff --git a/include/linux/ext2_fs_nvm.h b/include/linux/ext2_fs_nvm.h
+new file mode 100644
+index 00000000..7b980e42
+--- /dev/null
++++ b/include/linux/ext2_fs_nvm.h
+@@ -0,0 +1,63 @@
++#ifndef _EXT2_FS_NVM
++#define _EXT2_FS_NVM
++
++#include <linux/mm.h>
++#include <linux/ext2_fs.h>
++#include <linux/ext2_fs_sb.h>
++
++union header {
++	struct {
++		unsigned int size;
++		unsigned int stat;	/* 0 free, 1 busy */
++		union header *sucd;
++		union header *pred;
++	} s;
++	long align;
++};
++typedef union header header_t;
++
++union footer {
++	struct {
++		unsigned int size;
++		unsigned int stat;
++	} s;
++	long align;
++};
++typedef union footer footer_t;
++
++struct ext2_nvm_inode {
++	struct list_head  lru;		/* rw lock */
++	struct hlist_node hash;
++	ino_t  ino;
++	struct ext2_inode raw_inode;
++};
++
++struct ext2_nvm_block {
++	struct list_head lru;
++	struct hlist_node hash;
++};
++
++struct ext2_nvm_info {
++	/* Metadata of NVM */
++	unsigned long	initsize;	/* Size of nvm in bytes, default=0 */
++	phys_addr_t	phys_addr;
++	void		*virt_addr;
++	int		isalive;
++	/* NVM dynamic memory management */
++	header_t	*basep;		/* Pointer of the allocatable region */
++	header_t	*freep;		/* Pointer of the free list */
++	/* Entries of the file system's metadata */
++	struct ext2_super_block *es;
++	struct ext2_group_desc	**group_desc; /* Array of the group descriptors */
++	/* TODO: bitmap */
++	struct hlist_head *inode_htab;
++	/* TODO: data block */
++	struct hlist_head *block_htab;
++};
++
++static inline struct ext2_nvm_inode *EXT2_NVM_I(struct ext2_inode *inode)
++{
++	return container_of(inode, struct ext2_nvm_inode, raw_inode);
++}
++
++#endif	/* _EXT2_FS_NVM */
+diff --git a/include/linux/ext2_fs_sb.h b/include/linux/ext2_fs_sb.h
+index 1cdb6636..a1983659 100644
+--- a/include/linux/ext2_fs_sb.h
++++ b/include/linux/ext2_fs_sb.h
+@@ -19,6 +19,7 @@
+ #include <linux/blockgroup_lock.h>
+ #include <linux/percpu_counter.h>
+ #include <linux/rbtree.h>
++#include <linux/types.h>
+ 
+ /* XXX Here for now... not interested in restructing headers JUST now */
+ 
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index 9b678052..783b7166 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -15,8 +15,8 @@
+  * nr_file rlimit, so it's safe to set up a ridiculously high absolute
+  * upper limit on files-per-process.
+  *
+- * Some programs (notably those using select()) may have to be 
+- * recompiled to take full advantage of the new limits..  
++ * Some programs (notably those using select()) may have to be
++ * recompiled to take full advantage of the new limits..
+  */
+ 
+ /* Fixed constants first: */
+@@ -172,7 +172,7 @@ struct inodes_stat_t {
+ #define SEL_EX		4
+ 
+ /* public flags for file_system_type */
+-#define FS_REQUIRES_DEV 1 
++#define FS_REQUIRES_DEV 1
+ #define FS_BINARY_MOUNTDATA 2
+ #define FS_HAS_SUBTYPE 4
+ #define FS_REVAL_DOT	16384	/* Check the paths ".", ".." for staleness */
+@@ -469,7 +469,7 @@ struct iattr {
+  */
+ #include <linux/quota.h>
+ 
+-/** 
++/**
+  * enum positive_aop_returns - aop return codes with specific semantics
+  *
+  * @AOP_WRITEPAGE_ACTIVATE: Informs the caller that page writeback has
+@@ -479,7 +479,7 @@ struct iattr {
+  * 			    be a candidate for writeback again in the near
+  * 			    future.  Other callers must be careful to unlock
+  * 			    the page if they get this return.  Returned by
+- * 			    writepage(); 
++ * 			    writepage();
+  *
+  * @AOP_TRUNCATED_PAGE: The AOP method that was handed a locked page has
+  *  			unlocked it and the page might have been truncated.
+@@ -998,10 +998,10 @@ static inline int file_check_writeable(struct file *filp)
+ 
+ #define	MAX_NON_LFS	((1UL<<31) - 1)
+ 
+-/* Page cache limit. The filesystems should put that into their s_maxbytes 
+-   limits, otherwise bad things can happen in VM. */ 
++/* Page cache limit. The filesystems should put that into their s_maxbytes
++   limits, otherwise bad things can happen in VM. */
+ #if BITS_PER_LONG==32
+-#define MAX_LFS_FILESIZE	(((u64)PAGE_CACHE_SIZE << (BITS_PER_LONG-1))-1) 
++#define MAX_LFS_FILESIZE	(((u64)PAGE_CACHE_SIZE << (BITS_PER_LONG-1))-1)
+ #elif BITS_PER_LONG==64
+ #define MAX_LFS_FILESIZE 	0x7fffffffffffffffUL
+ #endif
+@@ -1360,6 +1360,7 @@ struct super_block {
+ 	char s_id[32];				/* Informational name */
+ 
+ 	void 			*s_fs_info;	/* Filesystem private info */
++	void			*s_fs_nvmi;
+ 	fmode_t			s_mode;
+ 
+ 	/*
+@@ -2142,7 +2143,7 @@ extern int may_open(struct path *, int, int);
+ 
+ extern int kernel_read(struct file *, loff_t, char *, unsigned long);
+ extern struct file * open_exec(const char *);
+- 
++
+ /* fs/dcache.c -- generic fs support functions */
+ extern int is_subdir(struct dentry *, struct dentry *);
+ extern ino_t find_inode_number(struct dentry *, struct qstr *);
+-- 
+2.17.1
+
